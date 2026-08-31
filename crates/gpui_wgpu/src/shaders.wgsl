@@ -956,8 +956,8 @@ struct Shadow {
     corner_radii: Corners,
     content_mask: Bounds,
     color: Hsla,
-    // Only consulted when `inset == 1u`: the element's own bounds, used as a rounded-rect
-    // clip so the shadow never escapes the element.
+    // The element's own bounds, used as a rounded-rect clip: an inset shadow never
+    // escapes the element, and a drop shadow never paints under it.
     element_bounds: Bounds,
     element_corner_radii: Corners,
     // 0 = drop shadow, 1 = inset shadow.
@@ -1035,13 +1035,19 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         }
     }
 
+    let element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+                                    shadow.element_corner_radii);
     if (shadow.inset != 0u) {
         // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
         // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
         alpha = 1.0 - alpha;
-        let element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
-                                        shadow.element_corner_radii);
         alpha *= saturate(0.5 - element_distance);
+    } else {
+        // A drop shadow is clipped to outside the element's border box, matching CSS.
+        // The area under the element must stay clear: when the fill above it is not
+        // opaque (a transparent window), an unclipped shadow reads as a dark wash
+        // across the whole element.
+        alpha *= saturate(0.5 + element_distance);
     }
 
     return blend_color(input.color, alpha);
