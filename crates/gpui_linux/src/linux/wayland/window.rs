@@ -24,6 +24,9 @@ use wayland_protocols::{
     wp::fractional_scale::v1::client::wp_fractional_scale_v1,
     xdg::dialog::v1::client::xdg_dialog_v1::XdgDialogV1,
 };
+use wayland_protocols::ext::background_effect::v1::client::{
+    ext_background_effect_manager_v1, ext_background_effect_surface_v1,
+};
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
@@ -98,6 +101,7 @@ pub struct WaylandWindowState {
     app_id: Option<String>,
     appearance: WindowAppearance,
     blur: Option<org_kde_kwin_blur::OrgKdeKwinBlur>,
+    background_effect: Option<ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1>,
     viewport: Option<wp_viewport::WpViewport>,
     outputs: HashMap<ObjectId, Output>,
     display: Option<(ObjectId, Output)>,
@@ -373,6 +377,7 @@ impl WaylandWindowState {
             surface,
             app_id: None,
             blur: None,
+            background_effect: None,
             viewport,
             globals,
             outputs: HashMap::default(),
@@ -466,6 +471,9 @@ impl Drop for WaylandWindow {
         // Destroy blur first, this has no dependencies.
         if let Some(blur) = &state.blur {
             blur.release();
+        }
+        if let Some(background_effect) = &state.background_effect {
+            background_effect.destroy();
         }
 
         // Decorations must be destroyed before the xdg state.
@@ -1606,8 +1614,16 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
     let opaque = !state.is_transparent();
 
     state.renderer.update_transparency(!opaque);
-    let opaque_area = state.window_bounds.map(|v| f32::from(v) as i32);
-    opaque_area.inset(f32::from(state.inset()) as i32);
+    // The visible content frame in surface-local coordinates: the surface bounds inset
+    // by the CSD shadow padding on non-tiled sides — the same rect committed as the
+    // xdg_surface geometry.
+    let opaque_area = inset_by_tiling(
+        state.bounds.map_origin(|_| px(0.0)),
+        state.inset(),
+        state.tiling,
+    )
+    .map(|v| f32::from(v) as i32)
+    .map_size(|v| if v <= 0 { 1 } else { v });
 
     let region = state
         .globals
@@ -1633,13 +1649,45 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
         state.surface.set_opaque_region(None);
     }
 
-    if let Some(ref blur_manager) = state.globals.blur_manager {
-        if state.background_appearance == WindowBackgroundAppearance::Blurred {
+    let wants_blur = state.background_appearance == WindowBackgroundAppearance::Blurred;
+    // Prefer the standard ext-background-effect protocol (KWin 6.7+, Mutter/GNOME 51+,
+    // niri); Plasma 6.7 dropped the legacy KDE blur protocol, and older Plasma only has
+    // the legacy one. In both cases blur just the content frame, so the transparent CSD
+    // shadow ring around it stays unblurred. Both requests copy the region, so it can be
+    // destroyed right after.
+    let ext_blur_supported = state.globals.background_effect_manager.is_some()
+        && (state
+            .globals
+            .background_effect_capabilities
+            .load(std::sync::atomic::Ordering::Relaxed)
+            & ext_background_effect_manager_v1::Capability::Blur.bits())
+            != 0;
+    if ext_blur_supported {
+        let manager = state.globals.background_effect_manager.as_ref().unwrap();
+        if wants_blur {
+            if state.background_effect.is_none() {
+                state.background_effect =
+                    Some(manager.get_background_effect(&state.surface, &state.globals.qh, ()));
+            }
+            // Double-buffered; takes effect on the next wl_surface commit.
+            state
+                .background_effect
+                .as_ref()
+                .unwrap()
+                .set_blur_region(Some(&region));
+        } else if let Some(background_effect) = state.background_effect.take() {
+            // Destroying the object removes the effect on the next commit.
+            background_effect.destroy();
+        }
+    } else if let Some(ref blur_manager) = state.globals.blur_manager {
+        if wants_blur {
             if state.blur.is_none() {
                 let blur = blur_manager.create(&state.surface, &state.globals.qh, ());
                 state.blur = Some(blur);
             }
-            state.blur.as_ref().unwrap().commit();
+            let blur = state.blur.as_ref().unwrap();
+            blur.set_region(Some(&region));
+            blur.commit();
         } else {
             // It probably doesn't hurt to clear the blur for opaque windows
             blur_manager.unset(&state.surface);

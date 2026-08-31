@@ -4,6 +4,10 @@ use std::{
     os::fd::{AsRawFd, BorrowedFd},
     path::PathBuf,
     rc::{Rc, Weak},
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -67,6 +71,10 @@ use wayland_protocols::{
     wp::fractional_scale::v1::client::{wp_fractional_scale_manager_v1, wp_fractional_scale_v1},
     xdg::dialog::v1::client::xdg_dialog_v1::XdgDialogV1,
 };
+use wayland_protocols::ext::background_effect::v1::client::{
+    ext_background_effect_manager_v1::{self, ExtBackgroundEffectManagerV1},
+    ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1,
+};
 use wayland_protocols_plasma::blur::client::{org_kde_kwin_blur, org_kde_kwin_blur_manager};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 use xkbcommon::xkb::ffi::XKB_KEYMAP_FORMAT_TEXT_V1;
@@ -127,6 +135,10 @@ pub struct Globals {
     pub decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
     pub layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
     pub blur_manager: Option<org_kde_kwin_blur_manager::OrgKdeKwinBlurManager>,
+    pub background_effect_manager: Option<ExtBackgroundEffectManagerV1>,
+    // Capability flags reported by the ext-background-effect manager; updated whenever the
+    // compositor sends a `capabilities` event.
+    pub background_effect_capabilities: Arc<AtomicU32>,
     pub text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
     pub gesture_manager: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
     pub dialog: Option<xdg_wm_dialog_v1::XdgWmDialogV1>,
@@ -142,6 +154,7 @@ impl Globals {
         seat: wl_seat::WlSeat,
     ) -> Self {
         let dialog_v = XdgWmDialogV1::interface().version;
+        let background_effect_capabilities = Arc::new(AtomicU32::new(0));
         Globals {
             activation: globals.bind(&qh, 1..=1, ()).ok(),
             compositor: globals
@@ -169,6 +182,10 @@ impl Globals {
             decoration_manager: globals.bind(&qh, 1..=1, ()).ok(),
             layer_shell: globals.bind(&qh, 1..=5, ()).ok(),
             blur_manager: globals.bind(&qh, 1..=1, ()).ok(),
+            background_effect_manager: globals
+                .bind(&qh, 1..=1, background_effect_capabilities.clone())
+                .ok(),
+            background_effect_capabilities,
             text_input_manager: globals.bind(&qh, 1..=1, ()).ok(),
             gesture_manager: globals.bind(&qh, 1..=3, ()).ok(),
             dialog: globals.bind(&qh, dialog_v..=dialog_v, ()).ok(),
@@ -1157,6 +1174,26 @@ delegate_noop!(WaylandClientStatePtr: ignore zwlr_layer_shell_v1::ZwlrLayerShell
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur_manager::OrgKdeKwinBlurManager);
 delegate_noop!(WaylandClientStatePtr: ignore zwp_text_input_manager_v3::ZwpTextInputManagerV3);
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur::OrgKdeKwinBlur);
+delegate_noop!(WaylandClientStatePtr: ignore ExtBackgroundEffectSurfaceV1);
+
+impl Dispatch<ExtBackgroundEffectManagerV1, Arc<AtomicU32>> for WaylandClientStatePtr {
+    fn event(
+        _: &mut WaylandClientStatePtr,
+        _: &ExtBackgroundEffectManagerV1,
+        event: ext_background_effect_manager_v1::Event,
+        capabilities: &Arc<AtomicU32>,
+        _: &Connection,
+        _: &QueueHandle<WaylandClientStatePtr>,
+    ) {
+        if let ext_background_effect_manager_v1::Event::Capabilities { flags } = event {
+            let raw = match flags {
+                WEnum::Value(value) => value.bits(),
+                WEnum::Unknown(value) => value,
+            };
+            capabilities.store(raw, Ordering::Relaxed);
+        }
+    }
+}
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewporter::WpViewporter);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewport::WpViewport);
 
