@@ -40,6 +40,10 @@ use wayland_client::{
         wl_shm_pool, wl_surface,
     },
 };
+use wayland_protocols::ext::background_effect::v1::client::{
+    ext_background_effect_manager_v1::{self, ExtBackgroundEffectManagerV1},
+    ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1,
+};
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
     zwp_pointer_gesture_pinch_v1, zwp_pointer_gestures_v1,
 };
@@ -70,10 +74,6 @@ use wayland_protocols::{
 use wayland_protocols::{
     wp::fractional_scale::v1::client::{wp_fractional_scale_manager_v1, wp_fractional_scale_v1},
     xdg::dialog::v1::client::xdg_dialog_v1::XdgDialogV1,
-};
-use wayland_protocols::ext::background_effect::v1::client::{
-    ext_background_effect_manager_v1::{self, ExtBackgroundEffectManagerV1},
-    ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1,
 };
 use wayland_protocols_plasma::blur::client::{org_kde_kwin_blur, org_kde_kwin_blur_manager};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
@@ -1178,7 +1178,7 @@ delegate_noop!(WaylandClientStatePtr: ignore ExtBackgroundEffectSurfaceV1);
 
 impl Dispatch<ExtBackgroundEffectManagerV1, Arc<AtomicU32>> for WaylandClientStatePtr {
     fn event(
-        _: &mut WaylandClientStatePtr,
+        this: &mut WaylandClientStatePtr,
         _: &ExtBackgroundEffectManagerV1,
         event: ext_background_effect_manager_v1::Event,
         capabilities: &Arc<AtomicU32>,
@@ -1190,7 +1190,17 @@ impl Dispatch<ExtBackgroundEffectManagerV1, Arc<AtomicU32>> for WaylandClientSta
                 WEnum::Value(value) => value.bits(),
                 WEnum::Unknown(value) => value,
             };
-            capabilities.store(raw, Ordering::Relaxed);
+            let previous = capabilities.swap(raw, Ordering::Relaxed);
+            // The event arrives a roundtrip after the bind, so windows opened
+            // in between saw an empty capability set and skipped their blur
+            // request; re-evaluate them against the real capabilities.
+            if previous != raw {
+                let client = this.get_client();
+                let windows: Vec<_> = client.borrow().windows.values().cloned().collect();
+                for window in windows {
+                    window.refresh_background_effects();
+                }
+            }
         }
     }
 }
