@@ -2359,6 +2359,15 @@ impl Window {
         self.platform_window.background_appearance()
     }
 
+    /// Rounds the corners of the background blur region to match content
+    /// drawn with rounded corners, so the compositor's blur doesn't bleed
+    /// past the curve as a square. No-op on platforms that don't shape the
+    /// blur region themselves (everything but Wayland today).
+    pub fn set_background_blur_corner_radius(&self, radius: Pixels) {
+        self.platform_window
+            .set_background_blur_corner_radius(radius);
+    }
+
     /// Mark the window as dirty at the platform level.
     pub fn set_window_edited(&mut self, edited: bool) {
         self.platform_window.set_edited(edited);

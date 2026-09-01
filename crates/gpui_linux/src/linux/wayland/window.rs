@@ -14,7 +14,7 @@ use wayland_backend::client::ObjectId;
 use wayland_client::WEnum;
 use wayland_client::{
     Proxy,
-    protocol::{wl_output, wl_surface},
+    protocol::{wl_output, wl_region, wl_surface},
 };
 use wayland_protocols::ext::background_effect::v1::client::{
     ext_background_effect_manager_v1, ext_background_effect_surface_v1,
@@ -112,6 +112,7 @@ pub struct WaylandWindowState {
     input_handler: Option<PlatformInputHandler>,
     decorations: WindowDecorations,
     background_appearance: WindowBackgroundAppearance,
+    blur_corner_radius: Pixels,
     fullscreen: bool,
     maximized: bool,
     tiling: Tiling,
@@ -388,6 +389,7 @@ impl WaylandWindowState {
             input_handler: None,
             decorations: WindowDecorations::Client,
             background_appearance: WindowBackgroundAppearance::Opaque,
+            blur_corner_radius: px(0.0),
             fullscreen: false,
             maximized: false,
             tiling: Tiling::default(),
@@ -1330,6 +1332,14 @@ impl PlatformWindow for WaylandWindow {
         update_window(state);
     }
 
+    fn set_background_blur_corner_radius(&self, radius: Pixels) {
+        let mut state = self.borrow_mut();
+        if state.blur_corner_radius != radius {
+            state.blur_corner_radius = radius;
+            update_window(state);
+        }
+    }
+
     fn background_appearance(&self) -> WindowBackgroundAppearance {
         self.borrow().background_appearance
     }
@@ -1663,6 +1673,18 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
     // the legacy one. In both cases blur just the content frame, so the transparent CSD
     // shadow ring around it stays unblurred. Both requests copy the region, so it can be
     // destroyed right after.
+    let blur_region = wants_blur.then(|| {
+        let blur_region = state
+            .globals
+            .compositor
+            .create_region(&state.globals.qh, ());
+        add_rounded_rect_to_region(
+            &blur_region,
+            opaque_area,
+            f32::from(state.blur_corner_radius),
+        );
+        blur_region
+    });
     let ext_blur_supported = state.globals.background_effect_manager.is_some()
         && (state
             .globals
@@ -1682,7 +1704,7 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
                 .background_effect
                 .as_ref()
                 .unwrap()
-                .set_blur_region(Some(&region));
+                .set_blur_region(blur_region.as_ref());
         } else if let Some(background_effect) = state.background_effect.take() {
             // Destroying the object removes the effect on the next commit.
             background_effect.destroy();
@@ -1694,7 +1716,7 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
                 state.blur = Some(blur);
             }
             let blur = state.blur.as_ref().unwrap();
-            blur.set_region(Some(&region));
+            blur.set_region(blur_region.as_ref());
             blur.commit();
         } else {
             // It probably doesn't hurt to clear the blur for opaque windows
@@ -1706,6 +1728,34 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
     }
 
     region.destroy();
+    if let Some(blur_region) = blur_region {
+        blur_region.destroy();
+    }
+}
+
+/// Add a rounded rectangle to a region as a union of horizontal strips: one
+/// pixel-row strip per corner-arc row, plus the full-width middle band. The
+/// compositor's blur is soft, so the pixel steps along the arc are invisible
+/// in the result.
+fn add_rounded_rect_to_region(region: &wl_region::WlRegion, bounds: Bounds<i32>, radius: f32) {
+    let x = bounds.origin.x;
+    let y = bounds.origin.y;
+    let width = bounds.size.width;
+    let height = bounds.size.height;
+    let radius = (radius.ceil() as i32).clamp(0, width.min(height) / 2);
+    if radius <= 0 {
+        region.add(x, y, width, height);
+        return;
+    }
+    let radius_f = radius as f32;
+    for row in 0..radius {
+        // Sample the arc at the row's vertical center.
+        let dy = radius_f - row as f32 - 0.5;
+        let inset = (radius_f - (radius_f * radius_f - dy * dy).sqrt()).ceil() as i32;
+        region.add(x + inset, y + row, width - 2 * inset, 1);
+        region.add(x + inset, y + height - 1 - row, width - 2 * inset, 1);
+    }
+    region.add(x, y + radius, width, height - 2 * radius);
 }
 
 pub(crate) trait WindowDecorationsExt {
