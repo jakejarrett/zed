@@ -662,6 +662,9 @@ impl WaylandWindowStatePtr {
 
                 if let Some(mut configure) = state.in_progress_configure.take() {
                     let got_unmaximized = state.maximized && !configure.maximized;
+                    let window_state_changed = state.fullscreen != configure.fullscreen
+                        || state.maximized != configure.maximized
+                        || state.tiling != configure.tiling;
                     state.fullscreen = configure.fullscreen;
                     state.maximized = configure.maximized;
                     state.tiling = configure.tiling;
@@ -688,6 +691,14 @@ impl WaylandWindowStatePtr {
                     drop(state);
                     if let Some(size) = configure.size {
                         self.resize(size);
+                    }
+                    if window_state_changed {
+                        // Tiling and fullscreen feed into the shadow inset, and
+                        // a configure whose size matches the current bounds
+                        // (e.g. maximized -> fullscreen on a panel-less output)
+                        // makes `resize` return early — recompute the opaque
+                        // and blur regions here so they track the new state.
+                        update_window(self.state.borrow_mut());
                     }
                 }
             }
@@ -1025,6 +1036,12 @@ impl WaylandWindowStatePtr {
                     .set_destination(f32::from(size.width) as i32, f32::from(size.height) as i32);
             }
         }
+
+        // The opaque and blur regions are sized to the content frame, and the
+        // compositor keeps whatever region was last committed — without this a
+        // resize (fullscreen, maximize, interactive drag) leaves it blurring
+        // the old geometry.
+        update_window(self.state.borrow_mut());
     }
 
     pub fn resize(&self, size: Size<Pixels>) {
