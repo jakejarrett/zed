@@ -1,11 +1,14 @@
 #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
 
 fn main() {
-    #[cfg(target_os = "macos")]
-    macos_build::run();
+    // Gate on the *target*, not the host: this crate is also cross-compiled
+    // for macOS from Linux, where `cfg!(target_os = "macos")` in a build
+    // script is false and nothing would be generated.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        macos_build::run();
+    }
 }
 
-#[cfg(target_os = "macos")]
 mod macos_build {
     use std::{
         env,
@@ -96,9 +99,23 @@ mod macos_build {
         output_path
     }
 
-    /// Locate the gpui crate directory relative to this crate.
+    /// Locate the gpui crate directory: a sibling of this crate in the
+    /// checkout. (Not through a `gpui` build-dependency: that would build
+    /// gpui for the *host*, which a Linux cross build has no business
+    /// doing.)
     fn find_gpui_crate_dir() -> PathBuf {
-        gpui::GPUI_MANIFEST_DIR.into()
+        let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+        let sibling = manifest_dir.join("../gpui");
+        if sibling.join("src/scene.rs").is_file() {
+            return sibling;
+        }
+        if let Ok(dir) = env::var("GPUI_MANIFEST_DIR") {
+            return PathBuf::from(dir);
+        }
+        panic!(
+            "cannot find the gpui crate next to gpui_macos at {}; set GPUI_MANIFEST_DIR",
+            sibling.display()
+        );
     }
 
     /// To enable runtime compilation, we need to "stitch" the shaders file with the generated header
@@ -129,7 +146,7 @@ mod macos_build {
             PathBuf::from(env::var("OUT_DIR").unwrap()).join("shaders.metallib");
         println!("cargo:rerun-if-changed={}", shader_path);
 
-        let output = Command::new("xcrun")
+        let output = match Command::new("xcrun")
             .args([
                 "-sdk",
                 "macosx",
@@ -145,7 +162,17 @@ mod macos_build {
             ])
             .arg(&air_output_path)
             .output()
-            .unwrap();
+        {
+            Ok(output) => output,
+            Err(error) => {
+                println!(
+                    "cargo::error=cannot run `xcrun metal` ({error}); building gpui_macos on a \
+                     non-macOS host needs the `runtime_shaders` feature, which compiles the \
+                     shaders on the target at startup instead"
+                );
+                process::exit(1);
+            }
+        };
 
         if !output.status.success() {
             println!(

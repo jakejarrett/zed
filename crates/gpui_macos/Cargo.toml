@@ -60,9 +60,10 @@ strum.workspace = true
 util.workspace = true
 uuid.workspace = true
 
-[target.'cfg(target_os = "macos")'.build-dependencies]
+# Host-side, whatever the host: this crate is cross-compiled for macOS from
+# Linux, where a macOS-only build-dependency would be missing.
+[build-dependencies]
 cbindgen = { version = "0.28.0", default-features = false }
-gpui.workspace = true
 
 # When this crate is itself being tested (cargo test -p gpui_macos), its own
 # cfg(test) flag enables impls of test-only traits like PlatformHeadlessRenderer
