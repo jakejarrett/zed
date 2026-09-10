@@ -57,7 +57,9 @@ pathfinder_geometry = { workspace = true, optional = true }
 smallvec.workspace = true
 thiserror.workspace = true
 
-[target.'cfg(any(target_os = "macos", target_os = "ios"))'.build-dependencies]
+# Host-side, whatever the host: this crate is cross-compiled for macOS from
+# Linux, where a macOS-only build-dependency would be missing.
+[build-dependencies]
 cbindgen.workspace = true
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dev-dependencies]

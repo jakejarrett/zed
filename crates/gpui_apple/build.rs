@@ -1,11 +1,17 @@
 #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
 
 fn main() {
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    apple_build::run();
+    // Gate on the *target*, not the host: this crate is also cross-compiled
+    // for macOS from Linux, where `cfg!(target_os = "macos")` in a build
+    // script is false and nothing would be generated.
+    if matches!(
+        std::env::var("CARGO_CFG_TARGET_OS").as_deref(),
+        Ok("macos" | "ios")
+    ) {
+        apple_build::run();
+    }
 }
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
 mod apple_build {
     use std::{
         env,
@@ -158,7 +164,7 @@ mod apple_build {
         let staged_shader_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("shaders.metal");
         std::fs::copy(shader_path, &staged_shader_path).unwrap();
 
-        let output = Command::new("xcrun")
+        let output = match Command::new("xcrun")
             .args([
                 "-sdk",
                 sdk,
@@ -172,7 +178,17 @@ mod apple_build {
             .args(["-include", header_path.to_str().unwrap(), "-o"])
             .arg(&air_output_path)
             .output()
-            .unwrap();
+        {
+            Ok(output) => output,
+            Err(error) => {
+                println!(
+                    "cargo::error=cannot run `xcrun metal` ({error}); building gpui_apple on a \
+                     non-Apple host needs the `runtime_shaders` feature, which compiles the \
+                     shaders on the target at startup instead"
+                );
+                process::exit(1);
+            }
+        };
 
         if !output.status.success() {
             println!(
