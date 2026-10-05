@@ -744,6 +744,96 @@ mod test {
         }
     }
 
+    struct Dragged;
+
+    struct DragPreview;
+
+    impl Render for DragPreview {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    struct DragAndDropView {
+        dropped: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl Render for DragAndDropView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            use crate::{StatefulInteractiveElement as _, Styled as _, px};
+            let dropped = self.dropped.clone();
+            div()
+                .size_full()
+                .child(
+                    div()
+                        .id("source")
+                        .absolute()
+                        .left(px(10.))
+                        .top(px(10.))
+                        .size(px(40.))
+                        .on_drag(Dragged, |_, _, _, cx| cx.new(|_| DragPreview)),
+                )
+                .child(
+                    div()
+                        .id("target")
+                        .absolute()
+                        .left(px(200.))
+                        .top(px(10.))
+                        .size(px(40.))
+                        .on_drop(move |_: &Dragged, _, _| dropped.set(true)),
+                )
+        }
+    }
+
+    /// A key held down keeps arriving as key-downs. One arriving between the
+    /// last mouse move and the release must not make the release land on
+    /// nothing: the pointer is still where it was.
+    #[gpui::test]
+    fn test_drop_lands_while_a_key_is_held(cx: &mut TestAppContext) {
+        use crate::{KeyDownEvent, Modifiers, MouseButton, point, px};
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (_, cx) = cx.add_window_view({
+            let dropped = dropped.clone();
+            |_, _| DragAndDropView { dropped }
+        });
+        let held = |is_held| KeyDownEvent {
+            keystroke: Keystroke::parse("a").unwrap(),
+            is_held,
+            prefer_character_input: false,
+        };
+
+        cx.simulate_event(held(false));
+        cx.simulate_mouse_down(point(px(30.), px(30.)), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(point(px(120.), px(30.)), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(point(px(220.), px(30.)), MouseButton::Left, Modifiers::default());
+        cx.simulate_event(held(true));
+        cx.simulate_mouse_up(point(px(220.), px(30.)), MouseButton::Left, Modifiers::default());
+        assert!(dropped.get(), "the drop was lost to the held key's repeat");
+    }
+
+    /// A key newly pressed mid-drag — a second note — is the keyboard's turn
+    /// until the mouse does something, and letting go of the button is the
+    /// mouse doing something.
+    #[gpui::test]
+    fn test_drop_lands_after_a_key_pressed_mid_drag(cx: &mut TestAppContext) {
+        use crate::{KeyDownEvent, Modifiers, MouseButton, point, px};
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (_, cx) = cx.add_window_view({
+            let dropped = dropped.clone();
+            |_, _| DragAndDropView { dropped }
+        });
+        cx.simulate_mouse_down(point(px(30.), px(30.)), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(point(px(120.), px(30.)), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(point(px(220.), px(30.)), MouseButton::Left, Modifiers::default());
+        cx.simulate_event(KeyDownEvent {
+            keystroke: Keystroke::parse("s").unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_mouse_up(point(px(220.), px(30.)), MouseButton::Left, Modifiers::default());
+        assert!(dropped.get(), "the drop was lost to a key pressed during the drag");
+    }
+
     #[gpui::test]
     fn test_on_events(cx: &mut TestAppContext) {
         let window = cx.update(|cx| {
