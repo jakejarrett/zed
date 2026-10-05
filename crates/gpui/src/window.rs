@@ -4518,9 +4518,18 @@ impl Window {
         // Hover is suppressed during keyboard modality so that keyboard navigation
         // doesn't show hover highlights on the item under the mouse cursor.
         let old_modality = self.last_input_modality;
+        //
+        // A key held down keeps arriving as key-downs, and those are not the
+        // keyboard taking a new turn: counted as one, each repeat would undo
+        // the mouse move before it, and a drag let go between two of them
+        // would land on nothing. Letting go of a button is the mouse's turn
+        // as much as pressing it is, so a release is hit-tested where it is
+        // even when a key was pressed since the pointer last moved.
         self.last_input_modality = match &event {
-            PlatformInput::KeyDown(_) => InputModality::Keyboard,
-            PlatformInput::MouseMove(_) | PlatformInput::MouseDown(_) => InputModality::Mouse,
+            PlatformInput::KeyDown(key_down) if !key_down.is_held => InputModality::Keyboard,
+            PlatformInput::MouseMove(_)
+            | PlatformInput::MouseDown(_)
+            | PlatformInput::MouseUp(_) => InputModality::Mouse,
             _ => self.last_input_modality,
         };
         if self.last_input_modality != old_modality {
