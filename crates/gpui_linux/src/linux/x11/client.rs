@@ -110,6 +110,70 @@ enum RefreshState {
     },
 }
 
+impl RefreshState {
+    fn refresh_rate(&self) -> Duration {
+        match self {
+            Self::Hidden { refresh_rate } | Self::PeriodicRefresh { refresh_rate, .. } => {
+                *refresh_rate
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeviceRect {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+impl DeviceRect {
+    fn contains(self, x: i64, y: i64) -> bool {
+        let left = i64::from(self.x);
+        let top = i64::from(self.y);
+        x >= left
+            && x < left + i64::from(self.width)
+            && y >= top
+            && y < top + i64::from(self.height)
+    }
+
+    fn intersection_area(self, other: Self) -> u64 {
+        let left = i64::from(self.x).max(i64::from(other.x));
+        let top = i64::from(self.y).max(i64::from(other.y));
+        let right = (i64::from(self.x) + i64::from(self.width))
+            .min(i64::from(other.x) + i64::from(other.width));
+        let bottom = (i64::from(self.y) + i64::from(self.height))
+            .min(i64::from(other.y) + i64::from(other.height));
+        u64::try_from((right - left).max(0)).unwrap_or_default()
+            * u64::try_from((bottom - top).max(0)).unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CrtcCandidate {
+    id: randr::Crtc,
+    bounds: DeviceRect,
+    refresh_rate_hz: Option<f64>,
+}
+
+fn select_crtc(window: DeviceRect, crtcs: &[CrtcCandidate]) -> Option<&CrtcCandidate> {
+    let center_x = i64::from(window.x) + i64::from(window.width) / 2;
+    let center_y = i64::from(window.y) + i64::from(window.height) / 2;
+    crtcs
+        .iter()
+        .filter(|candidate| candidate.bounds.contains(center_x, center_y))
+        .max_by_key(|candidate| candidate.bounds.intersection_area(window))
+        .or_else(|| {
+            crtcs
+                .iter()
+                .map(|candidate| (candidate, candidate.bounds.intersection_area(window)))
+                .filter(|(_, area)| *area > 0)
+                .max_by_key(|(_, area)| *area)
+                .map(|(candidate, _)| candidate)
+        })
+}
+
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum EventHandlerError {
@@ -306,6 +370,23 @@ impl X11ClientStatePtr {
 pub(crate) struct X11Client(pub(crate) Rc<RefCell<X11ClientState>>);
 
 impl X11Client {
+    fn update_window_refresh_loop(&self, x_window: xproto::Window) {
+        let Some(window) = self.get_window(x_window) else {
+            return;
+        };
+        let changed = self.0.borrow_mut().update_refresh_loop(x_window);
+        if changed {
+            window.display_configuration_changed();
+        }
+    }
+
+    fn update_all_window_refresh_loops(&self) {
+        let windows = self.0.borrow().windows.keys().copied().collect::<Vec<_>>();
+        for window in windows {
+            self.update_window_refresh_loop(window);
+        }
+    }
+
     pub(crate) fn new() -> anyhow::Result<Self> {
         let event_loop = EventLoop::try_new()?;
 
@@ -370,7 +451,17 @@ impl X11Client {
             .reply()
             .context("Failed to get XCB atoms")?;
 
-        let root = xcb_connection.setup().roots[0].root;
+        let root = xcb_connection.setup().roots[x_root_index].root;
+        check_reply(
+            || "Failed to select XRandR display-change events",
+            xcb_connection.randr_select_input(
+                root,
+                randr::NotifyMask::SCREEN_CHANGE
+                    | randr::NotifyMask::CRTC_CHANGE
+                    | randr::NotifyMask::OUTPUT_CHANGE
+                    | randr::NotifyMask::RESOURCE_CHANGE,
+            ),
+        )?;
         let compositor_present = check_compositor_present(&xcb_connection, root);
         let gtk_frame_extents_supported =
             check_gtk_frame_extents_supported(&xcb_connection, &atoms, root);
@@ -780,21 +871,27 @@ impl X11Client {
                 if let Some(window_ref) = state.windows.get_mut(&event.window) {
                     window_ref.is_mapped = false;
                 }
-                state.update_refresh_loop(event.window);
+                drop(state);
+                self.update_window_refresh_loop(event.window);
             }
             Event::MapNotify(event) => {
                 let mut state = self.0.borrow_mut();
                 if let Some(window_ref) = state.windows.get_mut(&event.window) {
                     window_ref.is_mapped = true;
                 }
-                state.update_refresh_loop(event.window);
+                drop(state);
+                self.update_window_refresh_loop(event.window);
             }
             Event::VisibilityNotify(event) => {
                 let mut state = self.0.borrow_mut();
                 if let Some(window_ref) = state.windows.get_mut(&event.window) {
                     window_ref.last_visibility = event.state;
                 }
-                state.update_refresh_loop(event.window);
+                drop(state);
+                self.update_window_refresh_loop(event.window);
+            }
+            Event::RandrNotify(_) | Event::RandrScreenChangeNotify(_) => {
+                self.update_all_window_refresh_loops();
             }
             Event::ClientMessage(event) => {
                 let window = self.get_window(event.window)?;
@@ -939,6 +1036,7 @@ impl X11Client {
                     .set_bounds(bounds)
                     .context("X11: Failed to set window bounds")
                     .log_err();
+                self.update_window_refresh_loop(event.window);
             }
             Event::PropertyNotify(event) => {
                 let window = self.get_window(event.window)?;
@@ -1875,85 +1973,117 @@ impl X11ClientState {
         self.xim_handler = Some(xim_handler);
     }
 
-    fn update_refresh_loop(&mut self, x_window: xproto::Window) {
+    fn crtc_candidates(&self, root: xproto::Window) -> Vec<CrtcCandidate> {
+        let Some(resources) = get_reply(
+            || "Failed to get current XRandR screen resources",
+            self.xcb_connection.randr_get_screen_resources_current(root),
+        )
+        .log_err() else {
+            return Vec::new();
+        };
+
+        resources
+            .crtcs
+            .iter()
+            .filter_map(|crtc| {
+                let info = self
+                    .xcb_connection
+                    .randr_get_crtc_info(*crtc, x11rb::CURRENT_TIME)
+                    .ok()?
+                    .reply()
+                    .ok()?;
+                if info.mode == 0 || info.width == 0 || info.height == 0 {
+                    return None;
+                }
+                let refresh_rate_hz = resources
+                    .modes
+                    .iter()
+                    .find(|mode| mode.id == info.mode)
+                    .and_then(mode_refresh_rate_hz);
+                Some(CrtcCandidate {
+                    id: *crtc,
+                    bounds: DeviceRect {
+                        x: i32::from(info.x),
+                        y: i32::from(info.y),
+                        width: u32::from(info.width),
+                        height: u32::from(info.height),
+                    },
+                    refresh_rate_hz,
+                })
+            })
+            .collect()
+    }
+
+    fn refresh_window_display_capabilities(
+        &mut self,
+        x_window: xproto::Window,
+    ) -> Option<(Duration, bool)> {
+        let window = self.windows.get(&x_window)?.window.clone();
+        let (bounds, root) = window.display_query_bounds();
+        let window_bounds = DeviceRect {
+            x: bounds.origin.x.0,
+            y: bounds.origin.y.0,
+            width: u32::try_from(bounds.size.width.0.max(0)).unwrap_or_default(),
+            height: u32::try_from(bounds.size.height.0.max(0)).unwrap_or_default(),
+        };
+        let candidates = self.crtc_candidates(root);
+        let selected = select_crtc(window_bounds, &candidates).copied();
+        let display_id = selected.map(|candidate| DisplayId::new(u64::from(candidate.id)));
+        let refresh_rate_hz = selected.and_then(|candidate| candidate.refresh_rate_hz);
+        let changed = window.set_display_capabilities(display_id, refresh_rate_hz);
+        let refresh_rate = refresh_rate_hz
+            .and_then(refresh_duration)
+            .unwrap_or_else(|| Duration::from_micros(1_000_000 / 60));
+        Some((refresh_rate, changed))
+    }
+
+    fn update_refresh_loop(&mut self, x_window: xproto::Window) -> bool {
+        let Some((refresh_rate, capabilities_changed)) =
+            self.refresh_window_display_capabilities(x_window)
+        else {
+            return false;
+        };
         let Some(window_ref) = self.windows.get_mut(&x_window) else {
-            return;
+            return capabilities_changed;
         };
         let is_visible = window_ref.is_mapped
             && !matches!(window_ref.last_visibility, Visibility::FULLY_OBSCURED);
-        match (is_visible, window_ref.refresh_state.take()) {
-            (false, refresh_state @ Some(RefreshState::Hidden { .. }))
-            | (false, refresh_state @ None)
-            | (true, refresh_state @ Some(RefreshState::PeriodicRefresh { .. })) => {
-                window_ref.refresh_state = refresh_state;
+        let previous = window_ref.refresh_state.take();
+        let previous = match previous {
+            Some(state) if state.refresh_rate() == refresh_rate => Some(state),
+            Some(RefreshState::PeriodicRefresh {
+                event_loop_token, ..
+            }) => {
+                self.loop_handle.remove(event_loop_token);
+                None
             }
+            Some(RefreshState::Hidden { .. }) | None => None,
+        };
+
+        let next = match (is_visible, previous) {
             (
                 false,
                 Some(RefreshState::PeriodicRefresh {
-                    refresh_rate,
-                    event_loop_token,
+                    event_loop_token, ..
                 }),
             ) => {
                 self.loop_handle.remove(event_loop_token);
-                window_ref.refresh_state = Some(RefreshState::Hidden { refresh_rate });
+                RefreshState::Hidden { refresh_rate }
             }
-            (true, Some(RefreshState::Hidden { refresh_rate })) => {
+            (false, _) => RefreshState::Hidden { refresh_rate },
+            (true, Some(state @ RefreshState::PeriodicRefresh { .. })) => state,
+            (true, Some(RefreshState::Hidden { .. })) | (true, None) => {
                 let event_loop_token = self.start_refresh_loop(x_window, refresh_rate);
-                let Some(window_ref) = self.windows.get_mut(&x_window) else {
-                    return;
-                };
-                window_ref.refresh_state = Some(RefreshState::PeriodicRefresh {
+                RefreshState::PeriodicRefresh {
                     refresh_rate,
                     event_loop_token,
-                });
+                }
             }
-            (true, None) => {
-                let Some(screen_resources) = get_reply(
-                    || "Failed to get screen resources",
-                    self.xcb_connection
-                        .randr_get_screen_resources_current(x_window),
-                )
-                .log_err() else {
-                    return;
-                };
-
-                // Ideally this would be re-queried when the window changes screens, but there
-                // doesn't seem to be an efficient / straightforward way to do this. Should also be
-                // updated when screen configurations change.
-                let mode_info = screen_resources.crtcs.iter().find_map(|crtc| {
-                    let crtc_info = self
-                        .xcb_connection
-                        .randr_get_crtc_info(*crtc, x11rb::CURRENT_TIME)
-                        .ok()?
-                        .reply()
-                        .ok()?;
-
-                    screen_resources
-                        .modes
-                        .iter()
-                        .find(|m| m.id == crtc_info.mode)
-                });
-                let refresh_rate = match mode_info {
-                    Some(mode_info) => mode_refresh_rate(mode_info),
-                    None => {
-                        log::error!(
-                            "Failed to get screen mode info from xrandr, \
-                            defaulting to 60hz refresh rate."
-                        );
-                        Duration::from_micros(1_000_000 / 60)
-                    }
-                };
-
-                let event_loop_token = self.start_refresh_loop(x_window, refresh_rate);
-                let Some(window_ref) = self.windows.get_mut(&x_window) else {
-                    return;
-                };
-                window_ref.refresh_state = Some(RefreshState::PeriodicRefresh {
-                    refresh_rate,
-                    event_loop_token,
-                });
-            }
+        };
+        if let Some(window_ref) = self.windows.get_mut(&x_window) {
+            window_ref.refresh_state = Some(next);
         }
+        capabilities_changed
     }
 
     #[must_use]
@@ -2130,15 +2260,20 @@ impl X11ClientState {
 
 // Adapted from:
 // https://docs.rs/winit/0.29.11/src/winit/platform_impl/linux/x11/monitor.rs.html#103-111
-pub fn mode_refresh_rate(mode: &randr::ModeInfo) -> Duration {
+fn mode_refresh_rate_hz(mode: &randr::ModeInfo) -> Option<f64> {
     if mode.dot_clock == 0 || mode.htotal == 0 || mode.vtotal == 0 {
-        return Duration::from_millis(16);
+        return None;
     }
 
-    let millihertz = mode.dot_clock as u64 * 1_000 / (mode.htotal as u64 * mode.vtotal as u64);
-    let micros = 1_000_000_000 / millihertz;
-    log::info!("Refreshing every {}ms", micros / 1_000);
-    Duration::from_micros(micros)
+    let refresh_rate_hz =
+        f64::from(mode.dot_clock) / (f64::from(mode.htotal) * f64::from(mode.vtotal));
+    (refresh_rate_hz.is_finite() && (24.0..=480.0).contains(&refresh_rate_hz))
+        .then_some(refresh_rate_hz)
+}
+
+fn refresh_duration(refresh_rate_hz: f64) -> Option<Duration> {
+    (refresh_rate_hz.is_finite() && refresh_rate_hz > 0.0)
+        .then(|| Duration::from_secs_f64(1.0 / refresh_rate_hz))
 }
 
 fn fp3232_to_f32(value: xinput::Fp3232) -> f32 {
@@ -2791,6 +2926,110 @@ fn xkb_state_for_key_event(xkb: &xkbc::State, event_state: xproto::KeyButMask) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn candidate(id: randr::Crtc, x: i16, y: i16, width: u16, height: u16) -> CrtcCandidate {
+        CrtcCandidate {
+            id,
+            bounds: DeviceRect {
+                x: i32::from(x),
+                y: i32::from(y),
+                width: u32::from(width),
+                height: u32::from(height),
+            },
+            refresh_rate_hz: Some(60.0),
+        }
+    }
+
+    #[test]
+    fn crtc_selection_should_prefer_the_crtc_containing_the_window_center() {
+        let window = DeviceRect {
+            x: 900,
+            y: 100,
+            width: 400,
+            height: 400,
+        };
+        let crtcs = [
+            candidate(11, 0, 0, 1_000, 1_000),
+            candidate(22, 1_000, 0, 1_000, 1_000),
+        ];
+
+        assert_eq!(select_crtc(window, &crtcs).map(|crtc| crtc.id), Some(22));
+    }
+
+    #[test]
+    fn crtc_selection_should_fall_back_to_the_greatest_intersection() {
+        let window = DeviceRect {
+            x: 800,
+            y: 100,
+            width: 400,
+            height: 400,
+        };
+        let crtcs = [
+            candidate(11, 0, 0, 900, 1_000),
+            candidate(22, 1_100, 0, 700, 1_000),
+        ];
+
+        assert_eq!(select_crtc(window, &crtcs).map(|crtc| crtc.id), Some(22));
+    }
+
+    #[test]
+    fn crtc_selection_should_report_missing_when_no_crtc_intersects() {
+        let window = DeviceRect {
+            x: 2_000,
+            y: 2_000,
+            width: 400,
+            height: 400,
+        };
+        let crtcs = [candidate(11, 0, 0, 1_000, 1_000)];
+
+        assert_eq!(select_crtc(window, &crtcs).map(|crtc| crtc.id), None);
+    }
+
+    #[test]
+    fn mode_refresh_rate_should_convert_fractional_xrandr_modes() {
+        let mode = randr::ModeInfo {
+            id: 1,
+            width: 2_560,
+            height: 1_440,
+            dot_clock: 650_000_000,
+            hsync_start: 0,
+            hsync_end: 0,
+            htotal: 2_720,
+            hskew: 0,
+            vsync_start: 0,
+            vsync_end: 0,
+            vtotal: 1_448,
+            name_len: 0,
+            mode_flags: randr::ModeFlag::default(),
+        };
+
+        let refresh_rate = mode_refresh_rate_hz(&mode).expect("mode should have a refresh rate");
+        assert!(
+            (refresh_rate - 165.03).abs() < 0.01,
+            "actual rate: {refresh_rate}"
+        );
+    }
+
+    #[test]
+    fn mode_refresh_rate_should_reject_invalid_xrandr_modes() {
+        let mode = randr::ModeInfo {
+            id: 1,
+            width: 0,
+            height: 0,
+            dot_clock: 0,
+            hsync_start: 0,
+            hsync_end: 0,
+            htotal: 0,
+            hskew: 0,
+            vsync_start: 0,
+            vsync_end: 0,
+            vtotal: 0,
+            name_len: 0,
+            mode_flags: randr::ModeFlag::default(),
+        };
+
+        assert_eq!(mode_refresh_rate_hz(&mode), None);
+    }
 
     fn test_keymap(layouts: &str) -> xkbc::Keymap {
         test_keymap_with_variant(layouts, "")

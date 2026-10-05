@@ -31,11 +31,11 @@ use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, GpuSpecs, Modifiers, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size, Tiling,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls,
-    WindowDecorations, WindowKind, WindowParams, layer_shell::LayerShellNotSupportedError, px,
-    size,
+    PlatformAtlas, PlatformBackend, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size,
+    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowControls, WindowDecorations, WindowKind, WindowParams,
+    layer_shell::LayerShellNotSupportedError, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig, wgpu};
 
@@ -558,6 +558,29 @@ impl WaylandWindow {
 }
 
 impl WaylandWindowStatePtr {
+    fn notify_moved(&self) {
+        let callback = self.callbacks.borrow_mut().moved.take();
+        if let Some(mut callback) = callback {
+            callback();
+            self.callbacks.borrow_mut().moved = Some(callback);
+        }
+    }
+
+    pub(crate) fn update_output(&self, id: &ObjectId, output: &Output) {
+        let mut state = self.state.borrow_mut();
+        let Some(previous) = state.outputs.get(id) else {
+            return;
+        };
+        if previous == output {
+            return;
+        }
+        state.outputs.insert(id.clone(), output.clone());
+        state.primary_output_scale();
+        state.update_subpixel_layout();
+        drop(state);
+        self.notify_moved();
+    }
+
     pub fn handle(&self) -> AnyWindowHandle {
         self.state.borrow().handle
     }
@@ -904,26 +927,36 @@ impl WaylandWindowStatePtr {
 
                 let scale = state.primary_output_scale();
                 state.update_subpixel_layout();
+                let uses_legacy_scale =
+                    state.surface.version() < wl_surface::EVT_PREFERRED_BUFFER_SCALE_SINCE;
 
                 // We use `PreferredBufferScale` instead to set the scale if it's available
-                if state.surface.version() < wl_surface::EVT_PREFERRED_BUFFER_SCALE_SINCE {
+                if uses_legacy_scale {
                     state.surface.set_buffer_scale(scale);
-                    drop(state);
+                }
+                drop(state);
+                if uses_legacy_scale {
                     self.rescale(scale as f32);
                 }
+                self.notify_moved();
             }
             wl_surface::Event::Leave { output } => {
                 state.outputs.remove(&output.id());
 
                 let scale = state.primary_output_scale();
                 state.update_subpixel_layout();
+                let uses_legacy_scale =
+                    state.surface.version() < wl_surface::EVT_PREFERRED_BUFFER_SCALE_SINCE;
 
                 // We use `PreferredBufferScale` instead to set the scale if it's available
-                if state.surface.version() < wl_surface::EVT_PREFERRED_BUFFER_SCALE_SINCE {
+                if uses_legacy_scale {
                     state.surface.set_buffer_scale(scale);
-                    drop(state);
+                }
+                drop(state);
+                if uses_legacy_scale {
                     self.rescale(scale as f32);
                 }
+                self.notify_moved();
             }
             wl_surface::Event::PreferredBufferScale { factor } => {
                 // We use `WpFractionalScale` instead to set the scale if it's available
@@ -1219,6 +1252,10 @@ impl PlatformWindow for WaylandWindow {
         self.borrow().scale
     }
 
+    fn backend(&self) -> PlatformBackend {
+        PlatformBackend::Wayland
+    }
+
     fn appearance(&self) -> WindowAppearance {
         self.borrow().appearance
     }
@@ -1232,6 +1269,13 @@ impl PlatformWindow for WaylandWindow {
                 bounds: display.bounds.to_pixels(state.scale),
             }) as Rc<dyn PlatformDisplay>
         })
+    }
+
+    fn refresh_rate_hz(&self) -> Option<f64> {
+        self.borrow()
+            .display
+            .as_ref()
+            .and_then(|(_, output)| output.refresh_rate_hz())
     }
 
     fn mouse_position(&self) -> Point<Pixels> {

@@ -582,6 +582,10 @@ impl Drop for WindowsWindow {
 }
 
 impl PlatformWindow for WindowsWindow {
+    fn backend(&self) -> PlatformBackend {
+        PlatformBackend::Windows
+    }
+
     fn bounds(&self) -> Bounds<Pixels> {
         self.state.bounds()
     }
