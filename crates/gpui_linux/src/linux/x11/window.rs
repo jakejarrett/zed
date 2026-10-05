@@ -3,11 +3,11 @@ use x11rb::connection::RequestConnection;
 
 use crate::linux::X11ClientStatePtr;
 use gpui::{
-    AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
-    Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, ScaledPixels, Scene, Size,
-    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowDecorations, WindowKind, WindowParams, px,
+    AnyWindowHandle, Bounds, Decorations, DevicePixels, DisplayId, ForegroundExecutor, GpuSpecs,
+    Modifiers, Pixels, PlatformAtlas, PlatformBackend, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
+    ResizeEdge, ScaledPixels, Scene, Size, Tiling, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowDecorations, WindowKind, WindowParams, px,
 };
 use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig};
 
@@ -270,6 +270,8 @@ pub struct X11WindowState {
     scale_factor: f32,
     renderer: WgpuRenderer,
     display: Rc<dyn PlatformDisplay>,
+    active_display_id: Option<DisplayId>,
+    refresh_rate_hz: Option<f64>,
     input_handler: Option<PlatformInputHandler>,
     appearance: WindowAppearance,
     background_appearance: WindowBackgroundAppearance,
@@ -779,6 +781,8 @@ impl X11WindowState {
                 client,
                 executor,
                 display,
+                active_display_id: None,
+                refresh_rate_hz: None,
                 x_root_window: visual_set.root,
                 x_screen_index,
                 visual_id: visual.id,
@@ -1003,6 +1007,35 @@ impl X11Window {
 }
 
 impl X11WindowStatePtr {
+    pub(crate) fn display_query_bounds(&self) -> (Bounds<DevicePixels>, xproto::Window) {
+        let state = self.state.borrow();
+        (
+            state.bounds.to_device_pixels(state.scale_factor),
+            state.x_root_window,
+        )
+    }
+
+    pub(crate) fn set_display_capabilities(
+        &self,
+        display_id: Option<DisplayId>,
+        refresh_rate_hz: Option<f64>,
+    ) -> bool {
+        let mut state = self.state.borrow_mut();
+        let changed =
+            state.active_display_id != display_id || state.refresh_rate_hz != refresh_rate_hz;
+        state.active_display_id = display_id;
+        state.refresh_rate_hz = refresh_rate_hz;
+        changed
+    }
+
+    pub(crate) fn display_configuration_changed(&self) {
+        let callback = self.callbacks.borrow_mut().moved.take();
+        if let Some(mut callback) = callback {
+            callback();
+            self.callbacks.borrow_mut().moved = Some(callback);
+        }
+    }
+
     pub fn should_close(&self) -> bool {
         let mut cb = self.callbacks.borrow_mut();
         if let Some(mut should_close) = cb.should_close.take() {
@@ -1395,12 +1428,24 @@ impl PlatformWindow for X11Window {
         self.0.state.borrow().scale_factor
     }
 
+    fn backend(&self) -> PlatformBackend {
+        PlatformBackend::X11
+    }
+
     fn appearance(&self) -> WindowAppearance {
         self.0.state.borrow().appearance
     }
 
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>> {
         Some(self.0.state.borrow().display.clone())
+    }
+
+    fn active_display_id(&self) -> Option<DisplayId> {
+        self.0.state.borrow().active_display_id
+    }
+
+    fn refresh_rate_hz(&self) -> Option<f64> {
+        self.0.state.borrow().refresh_rate_hz
     }
 
     fn mouse_position(&self) -> Point<Pixels> {

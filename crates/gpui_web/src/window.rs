@@ -5,7 +5,7 @@ use std::{cell::Cell, cell::RefCell, rc::Rc};
 
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult, GpuSpecs,
-    Modifiers, MouseButton, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    Modifiers, MouseButton, Pixels, PlatformAtlas, PlatformBackend, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
     ResizeEdge, Scene, Size, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
     WindowControlArea, WindowControls, WindowDecorations, WindowParams, px,
@@ -505,6 +505,10 @@ impl raw_window_handle::HasDisplayHandle for WebWindow {
 }
 
 impl PlatformWindow for WebWindow {
+    fn backend(&self) -> PlatformBackend {
+        PlatformBackend::Web
+    }
+
     fn bounds(&self) -> Bounds<Pixels> {
         self.inner.state.borrow().bounds
     }

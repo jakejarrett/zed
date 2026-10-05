@@ -2387,6 +2387,21 @@ impl Window {
             .find(|display| Some(display.id()) == self.display_id)
     }
 
+    /// Returns the window-system backend connected to this window.
+    pub fn platform_backend(&self) -> crate::PlatformBackend {
+        self.platform_window.backend()
+    }
+
+    /// Returns the active display identity reported by the connected window.
+    pub fn active_display_id(&self) -> Option<DisplayId> {
+        self.platform_window.active_display_id()
+    }
+
+    /// Returns the nominal refresh rate of the active display, when available.
+    pub fn refresh_rate_hz(&self) -> Option<f64> {
+        self.platform_window.refresh_rate_hz()
+    }
+
     /// Show the platform character palette.
     pub fn show_character_palette(&self) {
         self.platform_window.show_character_palette();

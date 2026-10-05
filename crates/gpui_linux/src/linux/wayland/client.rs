@@ -203,9 +203,21 @@ pub struct InProgressOutput {
     position: Option<Point<DevicePixels>>,
     size: Option<Size<DevicePixels>>,
     subpixel: Option<wl_output::Subpixel>,
+    refresh_millihertz: Option<i32>,
 }
 
 impl InProgressOutput {
+    fn set_mode(&mut self, flags: wl_output::Mode, refresh_millihertz: i32) {
+        if flags.contains(wl_output::Mode::Current) {
+            self.refresh_millihertz = Some(refresh_millihertz);
+        }
+    }
+
+    #[cfg(test)]
+    fn refresh_rate_hz(&self) -> Option<f64> {
+        self.refresh_millihertz.and_then(refresh_hz_from_millihertz)
+    }
+
     fn complete(&self) -> Option<Output> {
         if let Some((position, size)) = self.position.zip(self.size) {
             let scale = self.scale.unwrap_or(1);
@@ -214,6 +226,7 @@ impl InProgressOutput {
                 scale,
                 bounds: Bounds::new(position, size),
                 subpixel: self.subpixel,
+                refresh_millihertz: self.refresh_millihertz,
             })
         } else {
             None
@@ -227,6 +240,18 @@ pub struct Output {
     pub scale: i32,
     pub bounds: Bounds<DevicePixels>,
     pub subpixel: Option<wl_output::Subpixel>,
+    pub refresh_millihertz: Option<i32>,
+}
+
+impl Output {
+    pub(crate) fn refresh_rate_hz(&self) -> Option<f64> {
+        self.refresh_millihertz.and_then(refresh_hz_from_millihertz)
+    }
+}
+
+fn refresh_hz_from_millihertz(refresh_millihertz: i32) -> Option<f64> {
+    let refresh_hz = f64::from(refresh_millihertz) / 1_000.0;
+    (refresh_hz.is_finite() && (24.0..=480.0).contains(&refresh_hz)).then_some(refresh_hz)
 }
 
 pub(crate) struct WaylandClientState {
@@ -1288,12 +1313,27 @@ impl Dispatch<wl_output::WlOutput, ()> for WaylandClientStatePtr {
                     in_progress_output.subpixel = Some(subpixel);
                 }
             }
-            wl_output::Event::Mode { width, height, .. } => {
-                in_progress_output.size = Some(size(DevicePixels(width), DevicePixels(height)))
+            wl_output::Event::Mode {
+                flags,
+                width,
+                height,
+                refresh,
+            } => {
+                if let WEnum::Value(flags) = flags
+                    && flags.contains(wl_output::Mode::Current)
+                {
+                    in_progress_output.size = Some(size(DevicePixels(width), DevicePixels(height)));
+                    in_progress_output.set_mode(flags, refresh);
+                }
             }
             wl_output::Event::Done => {
                 if let Some(complete) = in_progress_output.complete() {
-                    state.outputs.insert(output.id(), complete);
+                    let output_id = output.id();
+                    state.outputs.insert(output_id.clone(), complete.clone());
+                    let windows = state.windows.values().cloned().collect::<Vec<_>>();
+                    for window in windows {
+                        window.update_output(&output_id, &complete);
+                    }
                 }
                 state.in_progress_outputs.remove(&output.id());
             }
@@ -2601,5 +2641,40 @@ impl Dispatch<XdgDialogV1, ()> for WaylandClientStatePtr {
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refresh_rate_should_convert_wayland_millihertz() {
+        assert_eq!(refresh_hz_from_millihertz(164_850), Some(164.85));
+    }
+
+    #[test]
+    fn refresh_rate_should_reject_missing_or_implausible_wayland_modes() {
+        assert_eq!(refresh_hz_from_millihertz(0), None);
+        assert_eq!(refresh_hz_from_millihertz(-60_000), None);
+        assert_eq!(refresh_hz_from_millihertz(481_000), None);
+    }
+
+    #[test]
+    fn current_output_mode_should_replace_previous_refresh_rate() {
+        let mut output = InProgressOutput::default();
+        output.set_mode(wl_output::Mode::Current, 60_000);
+        output.set_mode(wl_output::Mode::Current, 120_000);
+
+        assert_eq!(output.refresh_rate_hz(), Some(120.0));
+    }
+
+    #[test]
+    fn non_current_output_mode_should_not_replace_refresh_rate() {
+        let mut output = InProgressOutput::default();
+        output.set_mode(wl_output::Mode::Current, 60_000);
+        output.set_mode(wl_output::Mode::Preferred, 120_000);
+
+        assert_eq!(output.refresh_rate_hz(), Some(60.0));
     }
 }

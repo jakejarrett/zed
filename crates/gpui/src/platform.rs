@@ -616,6 +616,40 @@ pub struct RequestFrameOptions {
     pub force_render: bool,
 }
 
+/// The window-system backend connected to a platform window.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum PlatformBackend {
+    /// Apple's AppKit window backend.
+    MacOs,
+    /// Microsoft's Win32 window backend.
+    Windows,
+    /// The Wayland protocol backend.
+    Wayland,
+    /// The X Window System backend.
+    X11,
+    /// The web platform backend.
+    Web,
+    /// A platform without a graphical window connection.
+    Headless,
+    /// A backend that does not expose its identity.
+    Unknown,
+}
+
+impl PlatformBackend {
+    /// Returns the stable lowercase name of this backend.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MacOs => "macos",
+            Self::Windows => "windows",
+            Self::Wayland => "wayland",
+            Self::X11 => "x11",
+            Self::Web => "web",
+            Self::Headless => "headless",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
@@ -624,8 +658,17 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn content_size(&self) -> Size<Pixels>;
     fn resize(&mut self, size: Size<Pixels>);
     fn scale_factor(&self) -> f32;
+    fn backend(&self) -> PlatformBackend {
+        PlatformBackend::Unknown
+    }
     fn appearance(&self) -> WindowAppearance;
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;
+    fn active_display_id(&self) -> Option<DisplayId> {
+        self.display().map(|display| display.id())
+    }
+    fn refresh_rate_hz(&self) -> Option<f64> {
+        None
+    }
     fn mouse_position(&self) -> Point<Pixels>;
     fn modifiers(&self) -> Modifiers;
     fn capslock(&self) -> Capslock;
@@ -2345,6 +2388,13 @@ mod image_tests {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn platform_backend_should_expose_normalized_connected_identity() {
+        assert_eq!(PlatformBackend::Wayland.as_str(), "wayland");
+        assert_eq!(PlatformBackend::X11.as_str(), "x11");
+        assert_eq!(PlatformBackend::Headless.as_str(), "headless");
+    }
 
     #[test]
     fn test_window_button_layout_parse_standard() {
