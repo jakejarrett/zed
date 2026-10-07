@@ -992,11 +992,27 @@ mod test {
         };
 
         cx.simulate_event(held(false));
-        cx.simulate_mouse_down(point(px(30.), px(30.)), MouseButton::Left, Modifiers::default());
-        cx.simulate_mouse_move(point(px(120.), px(30.)), MouseButton::Left, Modifiers::default());
-        cx.simulate_mouse_move(point(px(220.), px(30.)), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_down(
+            point(px(30.), px(30.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            point(px(120.), px(30.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            point(px(220.), px(30.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
         cx.simulate_event(held(true));
-        cx.simulate_mouse_up(point(px(220.), px(30.)), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(
+            point(px(220.), px(30.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
         assert!(dropped.get(), "the drop was lost to the held key's repeat");
     }
 
@@ -1011,16 +1027,63 @@ mod test {
             let dropped = dropped.clone();
             |_, _| DragAndDropView { dropped }
         });
-        cx.simulate_mouse_down(point(px(30.), px(30.)), MouseButton::Left, Modifiers::default());
-        cx.simulate_mouse_move(point(px(120.), px(30.)), MouseButton::Left, Modifiers::default());
-        cx.simulate_mouse_move(point(px(220.), px(30.)), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_down(
+            point(px(30.), px(30.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            point(px(120.), px(30.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            point(px(220.), px(30.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
         cx.simulate_event(KeyDownEvent {
             keystroke: Keystroke::parse("s").unwrap(),
             is_held: false,
             prefer_character_input: false,
         });
-        cx.simulate_mouse_up(point(px(220.), px(30.)), MouseButton::Left, Modifiers::default());
-        assert!(dropped.get(), "the drop was lost to a key pressed during the drag");
+        cx.simulate_mouse_up(
+            point(px(220.), px(30.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        assert!(
+            dropped.get(),
+            "the drop was lost to a key pressed during the drag"
+        );
+    }
+
+    /// A content scale draws the window as if the display were denser: the
+    /// logical viewport shrinks, the scale factor grows, and the pointer is
+    /// read in content pixels.
+    #[gpui::test]
+    fn test_content_scale_shrinks_the_viewport_and_scales_input(cx: &mut TestAppContext) {
+        use crate::{Modifiers, point, px};
+        let (_, cx) = cx.add_window_view(|_, _| DragAndDropView {
+            dropped: std::rc::Rc::new(std::cell::Cell::new(false)),
+        });
+        let (viewport, scale) =
+            cx.update(|window, _| (window.viewport_size(), window.scale_factor()));
+        cx.update(|window, _| window.set_content_scale(2.0));
+        cx.update(|window, _| {
+            assert_eq!(window.content_scale(), 2.0);
+            assert_eq!(window.scale_factor(), scale * 2.0);
+            assert_eq!(window.viewport_size().width, viewport.width * 0.5);
+            assert_eq!(window.viewport_size().height, viewport.height * 0.5);
+        });
+        cx.simulate_mouse_move(point(px(100.), px(100.)), None, Modifiers::default());
+        cx.update(|window, _| assert_eq!(window.mouse_position(), point(px(50.), px(50.))));
+        cx.update(|window, _| window.set_content_scale(1.0));
+        cx.update(|window, _| {
+            assert_eq!(window.scale_factor(), scale);
+            assert_eq!(window.viewport_size(), viewport);
+            assert_eq!(window.mouse_position(), point(px(100.), px(100.)));
+        });
     }
 
     #[gpui::test]

@@ -16,13 +16,14 @@ use crate::{
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
     RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
-    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams,
-    WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, ScrollDelta, Shadow,
+    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
+    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
+    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowInsets, WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point,
+    prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -1271,6 +1272,10 @@ pub struct Window {
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
+    /// A scale the app asks for on top of the display's: the window draws as
+    /// if the display were this much denser and its logical viewport shrinks
+    /// to match. 1.0 is the display as it is.
+    content_scale: f32,
     pub(crate) bounds_observers: SubscriberSet<(), AnyObserver>,
     appearance: WindowAppearance,
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
@@ -2054,7 +2059,10 @@ impl Window {
             let mut cx = cx.to_async();
             Box::new(move |event| {
                 handle
-                    .update(&mut cx, |_, window, cx| window.dispatch_event(event, cx))
+                    .update(&mut cx, |_, window, cx| {
+                        let event = window.scale_platform_input(event);
+                        window.dispatch_event(event, cx)
+                    })
                     .log_err()
                     .unwrap_or(DispatchEventResult::default())
             })
@@ -2175,6 +2183,7 @@ impl Window {
             modifiers,
             capslock,
             scale_factor,
+            content_scale: 1.0,
             bounds_observers: SubscriberSet::new(),
             appearance,
             appearance_observers: SubscriberSet::new(),
@@ -2801,9 +2810,8 @@ impl Window {
     /// the platform window, then notifies observers. Normally called automatically
     /// by the platform's resize callback, but exposed publicly for test infrastructure.
     pub fn bounds_changed(&mut self, cx: &mut App) {
-        self.scale_factor = self.platform_window.scale_factor();
-        self.viewport_size = self.platform_window.content_size();
-        self.mouse_position = self.platform_window.mouse_position();
+        self.sync_platform_metrics();
+        self.mouse_position = self.from_platform_pixels(self.platform_window.mouse_position());
 
         self.refresh();
 
@@ -3013,7 +3021,9 @@ impl Window {
 
     /// Opens the native title bar context menu, useful when implementing client side decorations (Wayland and X11)
     pub fn show_window_menu(&self, position: Point<Pixels>) {
-        self.platform_window.show_window_menu(position)
+        let scale = self.content_scale;
+        self.platform_window
+            .show_window_menu(position.map(|v| v * scale))
     }
 
     /// Handle window movement for Linux and macOS.
@@ -3128,6 +3138,126 @@ impl Window {
     pub fn set_scale_factor(&mut self, scale_factor: f32) {
         self.scale_factor = scale_factor;
         self.refresh();
+    }
+
+    /// The display's own scale factor, without the content scale.
+    pub fn platform_scale_factor(&self) -> f32 {
+        self.platform_window.scale_factor()
+    }
+
+    /// The scale the app asked for on top of the display's. See [`Window::set_content_scale`].
+    pub fn content_scale(&self) -> f32 {
+        self.content_scale
+    }
+
+    /// Draw the window's content as if the display were `scale` times denser:
+    /// every logical pixel is `scale` times larger on screen and the logical
+    /// viewport shrinks by the same amount. Layout, text rasterisation and
+    /// hit-testing all follow; input positions are converted on arrival. This
+    /// is a zoom of the whole window, unlike [`Window::set_rem_size`], which
+    /// scales only rem-based lengths.
+    pub fn set_content_scale(&mut self, scale: f32) {
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        if scale == self.content_scale {
+            return;
+        }
+        // Keep the pointer where it is on screen, not where it was in the
+        // old content coordinates.
+        let ratio = self.content_scale / scale;
+        self.mouse_position = self.mouse_position.map(|v| v * ratio);
+        self.content_scale = scale;
+        self.sync_platform_metrics();
+        self.refresh();
+    }
+
+    fn sync_platform_metrics(&mut self) {
+        self.scale_factor = self.platform_window.scale_factor() * self.content_scale;
+        let inverse = 1.0 / self.content_scale;
+        self.viewport_size = self.platform_window.content_size().map(|v| v * inverse);
+    }
+
+    /// Platform input arrives in the display's logical pixels; the window
+    /// works in content pixels, which differ by the content scale. Applied
+    /// where the platform hands input over, not in `dispatch_event`, which
+    /// also takes events GPUI makes itself in content pixels (recognized
+    /// touch gestures, accessibility clicks, simulated input).
+    fn scale_platform_input(&self, event: PlatformInput) -> PlatformInput {
+        if self.content_scale == 1.0 {
+            return event;
+        }
+        let inverse = 1.0 / self.content_scale;
+        let scale = |position: Point<Pixels>| position.map(|v| v * inverse);
+        match event {
+            PlatformInput::MouseMove(mut e) => {
+                e.position = scale(e.position);
+                PlatformInput::MouseMove(e)
+            }
+            PlatformInput::MouseDown(mut e) => {
+                e.position = scale(e.position);
+                PlatformInput::MouseDown(e)
+            }
+            PlatformInput::MouseUp(mut e) => {
+                e.position = scale(e.position);
+                PlatformInput::MouseUp(e)
+            }
+            PlatformInput::MousePressure(mut e) => {
+                e.position = scale(e.position);
+                PlatformInput::MousePressure(e)
+            }
+            PlatformInput::Scroll(mut e) => {
+                e.position = scale(e.position);
+                if let ScrollDelta::Pixels(delta) = e.delta {
+                    e.delta = ScrollDelta::Pixels(scale(delta));
+                }
+                PlatformInput::Scroll(e)
+            }
+            PlatformInput::Touch(mut e) => {
+                e.position = scale(e.position);
+                e.predicted_position = e.predicted_position.map(scale);
+                PlatformInput::Touch(e)
+            }
+            PlatformInput::BackGesture(mut e) => {
+                e.start_position = scale(e.start_position);
+                PlatformInput::BackGesture(e)
+            }
+            PlatformInput::Pinch(mut e) => {
+                e.position = scale(e.position);
+                PlatformInput::Pinch(e)
+            }
+            PlatformInput::FileDrop(drop) => PlatformInput::FileDrop(match drop {
+                FileDropEvent::Entered { position, paths } => FileDropEvent::Entered {
+                    position: scale(position),
+                    paths,
+                },
+                FileDropEvent::Pending { position } => FileDropEvent::Pending {
+                    position: scale(position),
+                },
+                FileDropEvent::Submit { position } => FileDropEvent::Submit {
+                    position: scale(position),
+                },
+                FileDropEvent::Exited => FileDropEvent::Exited,
+                FileDropEvent::Ended => FileDropEvent::Ended,
+            }),
+            other => other,
+        }
+    }
+
+    /// Content pixels to the display's logical pixels, for anything handed
+    /// back to the platform.
+    pub(crate) fn to_platform_pixels(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        let scale = self.content_scale;
+        bounds.map(|v| v * scale)
+    }
+
+    /// The display's logical pixels to content pixels, for points the platform hands us
+    /// outside the input stream.
+    pub(crate) fn from_platform_pixels(&self, point: Point<Pixels>) -> Point<Pixels> {
+        let inverse = 1.0 / self.content_scale;
+        point.map(|v| v * inverse)
     }
 
     /// The size of an em for the base font of the application. Adjusting this value allows the
@@ -6721,6 +6851,7 @@ impl Window {
         self.on_next_frame(|window, cx| {
             if let Some(mut input_handler) = window.platform_window.take_input_handler() {
                 if let Some(bounds) = input_handler.selected_bounds(window, cx) {
+                    let bounds = window.to_platform_pixels(bounds);
                     window.platform_window.update_ime_position(bounds);
                 }
                 window.platform_window.set_input_handler(input_handler);
