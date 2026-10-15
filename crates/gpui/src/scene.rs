@@ -73,7 +73,7 @@ impl Scene {
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
         let clipped_bounds = primitive
-            .bounds()
+            .visible_bounds()
             .intersect(&primitive.content_mask().bounds);
 
         if clipped_bounds.is_empty() {
@@ -228,6 +228,22 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+        }
+    }
+
+    /// Where the primitive lands on screen: its bounds, or for a sprite
+    /// drawn through a transformation, the box the transformed sprite
+    /// covers. What it is culled and ordered by, so a rotated glyph whose
+    /// untransformed bounds lie outside the content mask is still drawn.
+    pub fn visible_bounds(&self) -> Bounds<ScaledPixels> {
+        match self {
+            Primitive::MonochromeSprite(sprite) => {
+                sprite.transformation.transform_bounds(sprite.bounds)
+            }
+            Primitive::SubpixelSprite(sprite) => {
+                sprite.transformation.transform_bounds(sprite.bounds)
+            }
+            primitive => *primitive.bounds(),
         }
     }
 
@@ -639,6 +655,38 @@ impl TransformationMatrix {
     }
 
     /// Apply transformation to a point, mainly useful for debugging
+    /// The axis-aligned box `bounds` covers once transformed.
+    pub fn transform_bounds(&self, bounds: Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
+        if *self == Self::unit() {
+            return bounds;
+        }
+        let corner = |x: f32, y: f32| {
+            (
+                self.rotation_scale[0][0] * x + self.rotation_scale[0][1] * y + self.translation[0],
+                self.rotation_scale[1][0] * x + self.rotation_scale[1][1] * y + self.translation[1],
+            )
+        };
+        let (left, top) = (bounds.origin.x.0, bounds.origin.y.0);
+        let (right, bottom) = (left + bounds.size.width.0, top + bounds.size.height.0);
+        let corners = [
+            corner(left, top),
+            corner(right, top),
+            corner(left, bottom),
+            corner(right, bottom),
+        ];
+        let min_x = corners.iter().map(|c| c.0).fold(f32::INFINITY, f32::min);
+        let min_y = corners.iter().map(|c| c.1).fold(f32::INFINITY, f32::min);
+        let max_x = corners.iter().map(|c| c.0).fold(f32::NEG_INFINITY, f32::max);
+        let max_y = corners.iter().map(|c| c.1).fold(f32::NEG_INFINITY, f32::max);
+        Bounds {
+            origin: Point::new(ScaledPixels(min_x), ScaledPixels(min_y)),
+            size: Size {
+                width: ScaledPixels(max_x - min_x),
+                height: ScaledPixels(max_y - min_y),
+            },
+        }
+    }
+
     pub fn apply(&self, point: Point<Pixels>) -> Point<Pixels> {
         let input = [point.x.0, point.y.0];
         let mut output = self.translation;
@@ -897,5 +945,33 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod transform_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn a_quarter_turn_about_a_point_covers_the_turned_box() {
+        // A 40×10 box from (100, 100), turned a quarter anticlockwise about
+        // (120, 105), its centre: 10 wide and 40 tall about the same centre.
+        let centre = Point::new(ScaledPixels(120.0), ScaledPixels(105.0));
+        let turn = TransformationMatrix::unit()
+            .translate(centre)
+            .rotate(Radians(-std::f32::consts::FRAC_PI_2))
+            .translate(Point::new(ScaledPixels(-120.0), ScaledPixels(-105.0)));
+        let bounds = Bounds {
+            origin: Point::new(ScaledPixels(100.0), ScaledPixels(100.0)),
+            size: Size {
+                width: ScaledPixels(40.0),
+                height: ScaledPixels(10.0),
+            },
+        };
+        let turned = turn.transform_bounds(bounds);
+        let close = |a: ScaledPixels, b: f32| (a.0 - b).abs() < 1e-3;
+        assert!(close(turned.origin.x, 115.0) && close(turned.origin.y, 85.0), "{turned:?}");
+        assert!(close(turned.size.width, 10.0) && close(turned.size.height, 40.0), "{turned:?}");
+        assert_eq!(TransformationMatrix::unit().transform_bounds(bounds), bounds);
     }
 }
