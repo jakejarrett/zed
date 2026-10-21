@@ -538,7 +538,7 @@ mod tests {
             .collect();
 
         let status = Command::new("cargo")
-            .args(["build", "--package", "gpui"])
+            .args(["build", "--package", "gpui_lint_fixture"])
             .current_dir(&fixture_dir)
             .status()
             .expect("failed to run cargo build for gpui fixture");

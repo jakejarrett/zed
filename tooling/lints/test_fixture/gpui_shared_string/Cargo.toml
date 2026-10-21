@@ -1,8 +1,11 @@
 [package]
-name = "gpui_shared_string"
+# Named apart from the real `gpui_shared_string` so a git dependency on this
+# repository resolves to the real one; the library keeps its name.
+name = "gpui_shared_string_lint_fixture"
 version = "0.0.0"
 edition = "2021"
 publish = false
 
 [lib]
+name = "gpui_shared_string"
 path = "src/lib.rs"
