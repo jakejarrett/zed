@@ -1632,6 +1632,12 @@ impl PlatformWindow for X11Window {
         self.0.state.borrow().background_appearance
     }
 
+    fn set_low_power_rendering(&self, enabled: bool) {
+        if let Some(renderer) = &mut self.0.state.borrow_mut().renderer {
+            renderer.set_low_power(enabled);
+        }
+    }
+
     fn is_subpixel_rendering_supported(&self) -> bool {
         self.0
             .state

@@ -1,10 +1,11 @@
+use crate::damage::{Damage, FrameDigest};
 use crate::{CompositorGpuHint, DeviceErrorState, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, GpuSpecs, Hsla, Path, Point,
+    PrimitiveBatch, Quad, ScaledPixels, Scene, Size, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -125,6 +126,9 @@ pub struct WgpuSurfaceConfig {
 
 struct WgpuPipelines {
     quads: wgpu::RenderPipeline,
+    /// The quad pipeline writing without blending: clears a damaged region of
+    /// the kept frame to transparent before it is drawn again.
+    quads_clear: wgpu::RenderPipeline,
     shadows: wgpu::RenderPipeline,
     path_rasterization: wgpu::RenderPipeline,
     paths: wgpu::RenderPipeline,
@@ -194,6 +198,9 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    /// The last frame, kept so the next can draw only what changed over it
+    /// (damage redraw), then be copied to the swapchain image.
+    damage_target: Option<(wgpu::Texture, wgpu::TextureView)>,
 }
 
 struct CachedTextureBindGroup {
@@ -207,6 +214,7 @@ impl WgpuResources {
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
+        self.damage_target = None;
     }
 }
 
@@ -225,6 +233,15 @@ struct WgpuRendererCore {
     adapter_info: wgpu::AdapterInfo,
     target_format: wgpu::TextureFormat,
     max_texture_size: u32,
+    /// Fewer, cheaper pixels for slow GPUs: 2x path multisampling, no
+    /// shadows, and damage redraw ([`WgpuRenderer::set_low_power`]).
+    low_power: bool,
+    /// The path sample count picked for the adapter, used out of low power.
+    full_path_sample_count: u32,
+    /// `GPUI_DAMAGE_REDRAW=0|1`: damage redraw forced off or on.
+    damage_redraw_override: Option<bool>,
+    /// What the kept frame (`damage_target`) shows, to compare the next with.
+    last_digest: Option<FrameDigest>,
 }
 
 /// GPU resources of a windowed renderer. A surface is only ever configured against the
@@ -262,6 +279,9 @@ pub struct WgpuRenderer {
     observed_error_generation: u64,
     last_surface_error: Option<String>,
     needs_redraw: bool,
+    /// Whether the swapchain image can be copied to, which damage redraw
+    /// needs to put the kept frame on screen.
+    surface_copy_dst: bool,
 }
 
 impl WgpuRenderer {
@@ -450,8 +470,15 @@ impl WgpuRenderer {
             );
         }
 
+        let surface_copy_dst = surface_caps
+            .usages
+            .contains(wgpu::TextureUsages::COPY_DST);
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: if surface_copy_dst {
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST
+            } else {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+            },
             format: surface_format,
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: clamped_width.max(1),
@@ -485,7 +512,17 @@ impl WgpuRenderer {
             observed_error_generation: 0,
             last_surface_error: None,
             needs_redraw: false,
+            surface_copy_dst,
         })
+    }
+
+    /// Draw for a slow GPU: 2x path multisampling, no shadows, and only what
+    /// changed since the last frame (damage redraw).
+    pub fn set_low_power(&mut self, enabled: bool) {
+        let alpha_mode = self.surface_config.alpha_mode;
+        if let Some(core) = self.core_mut() {
+            core.set_low_power(enabled, alpha_mode);
+        }
     }
 }
 
@@ -791,6 +828,23 @@ impl WgpuRendererCore {
             &shader_module,
         );
 
+        let quads_clear = create_pipeline(
+            "quads_clear",
+            "vs_quad",
+            "fs_quad",
+            &layouts.globals,
+            &layouts.instances,
+            None,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            1,
+            &shader_module,
+        );
+
         let shadows = create_pipeline(
             "shadows",
             "vs_shadow",
@@ -926,6 +980,7 @@ impl WgpuRendererCore {
 
         WgpuPipelines {
             quads,
+            quads_clear,
             shadows,
             path_rasterization,
             paths,
@@ -1149,6 +1204,7 @@ impl WgpuRenderer {
                 panic!("Too many consecutive GPU errors. Last error: {error}");
             } else if self.failed_frame_count > 5 {
                 core.resources.invalidate_intermediate_textures();
+                core.last_digest = None;
                 self.atlas.clear();
                 self.needs_redraw = true;
                 self.failed_frame_count = 0;
@@ -1190,12 +1246,77 @@ impl WgpuRenderer {
             .create_view(&wgpu::TextureViewDescriptor::default());
         let premultiplied_alpha =
             self.surface_config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
+
+        if self.surface_copy_dst && core.damage_redraw() {
+            // Draw over the kept frame where this one differs, then copy the
+            // whole of it to the swapchain image.
+            let digest = FrameDigest::of(scene, size);
+            let fresh = core.ensure_damage_target(size);
+            let damage = if fresh {
+                Damage::Full
+            } else {
+                digest.damage_since(core.last_digest.as_ref())
+            };
+            let Some((target, target_view)) = core.resources.damage_target.clone() else {
+                return false;
+            };
+            let drawn = match damage {
+                Damage::None => Ok(()),
+                Damage::Region(region) => core
+                    .render_frame(
+                        scene,
+                        &target_view,
+                        size,
+                        premultiplied_alpha,
+                        wgpu::Color::TRANSPARENT,
+                        Some(region),
+                    )
+                    .map(drop),
+                Damage::Full => core
+                    .render_frame(
+                        scene,
+                        &target_view,
+                        size,
+                        premultiplied_alpha,
+                        wgpu::Color::TRANSPARENT,
+                        None,
+                    )
+                    .map(drop),
+            };
+            if let Err(error) = drawn {
+                core.last_digest = None;
+                log::error!("{error:#}");
+                return false;
+            }
+            core.last_digest = Some(digest);
+            let mut encoder =
+                core.resources
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("damage_copy_encoder"),
+                    });
+            encoder.copy_texture_to_texture(
+                target.as_image_copy(),
+                frame.texture.as_image_copy(),
+                wgpu::Extent3d {
+                    width: size.width.0 as u32,
+                    height: size.height.0 as u32,
+                    depth_or_array_layers: 1,
+                },
+            );
+            core.resources.queue.submit(std::iter::once(encoder.finish()));
+            core.resources.queue.present(frame);
+            return true;
+        }
+
+        core.last_digest = None;
         if let Err(error) = core.render_frame(
             scene,
             &frame_view,
             size,
             premultiplied_alpha,
             wgpu::Color::TRANSPARENT,
+            None,
         ) {
             log::error!("{error:#}");
             return false;
@@ -1215,7 +1336,16 @@ impl WgpuRendererCore {
     ) -> Self {
         let device = Arc::clone(&context.device);
         let queue = Arc::clone(&context.queue);
-        let rendering_params = RenderingParameters::new(&context.adapter, target_format);
+        let mut rendering_params = RenderingParameters::new(&context.adapter, target_format);
+        let full_path_sample_count = rendering_params.path_sample_count;
+        // `GPUI_PATH_SAMPLES=1|2|4`, for comparing what multisampling costs.
+        if let Some(samples) = std::env::var("GPUI_PATH_SAMPLES")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|samples| *samples <= full_path_sample_count && samples.is_power_of_two())
+        {
+            rendering_params.path_sample_count = samples;
+        }
         let uses_webgl_instance_data = context.uses_webgl_instance_data();
         let dual_source_blending =
             context.supports_dual_source_blending() && !uses_webgl_instance_data;
@@ -1347,6 +1477,7 @@ impl WgpuRendererCore {
                 path_intermediate_view: None,
                 path_msaa_texture: None,
                 path_msaa_view: None,
+                damage_target: None,
             },
             atlas,
             path_globals_offset,
@@ -1361,7 +1492,80 @@ impl WgpuRendererCore {
             adapter_info: context.adapter.get_info(),
             target_format,
             max_texture_size,
+            low_power: false,
+            full_path_sample_count,
+            damage_redraw_override: std::env::var("GPUI_DAMAGE_REDRAW")
+                .ok()
+                .map(|value| value != "0"),
+            last_digest: None,
         }
+    }
+
+    /// Whether frames are drawn over the last one, only where they differ.
+    fn damage_redraw(&self) -> bool {
+        self.damage_redraw_override.unwrap_or(self.low_power)
+    }
+
+    /// The kept frame for damage redraw, made at `size` if it is not; whether
+    /// it was just made (and so holds nothing to draw over).
+    fn ensure_damage_target(&mut self, size: Size<DevicePixels>) -> bool {
+        let (width, height) = (size.width.0 as u32, size.height.0 as u32);
+        if self
+            .resources
+            .damage_target
+            .as_ref()
+            .is_some_and(|(texture, _)| texture.width() == width && texture.height() == height)
+        {
+            return false;
+        }
+        let texture = self
+            .resources
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("damage_target"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.target_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.resources.damage_target = Some((texture, view));
+        true
+    }
+
+    fn set_low_power(&mut self, enabled: bool, alpha_mode: wgpu::CompositeAlphaMode) {
+        if self.low_power == enabled {
+            return;
+        }
+        self.low_power = enabled;
+        self.last_digest = None;
+        let samples = if enabled {
+            self.full_path_sample_count.min(2)
+        } else {
+            self.full_path_sample_count
+        };
+        if samples == self.rendering_params.path_sample_count {
+            return;
+        }
+        self.rendering_params.path_sample_count = samples;
+        let resources = &mut self.resources;
+        resources.pipelines = Self::create_pipelines(
+            &resources.device,
+            &resources.bind_group_layouts,
+            self.target_format,
+            alpha_mode,
+            samples,
+            self.dual_source_blending,
+            self.uses_webgl_instance_data,
+        );
+        resources.invalidate_intermediate_textures();
     }
 
     fn resources(&self) -> &WgpuResources {
@@ -1415,6 +1619,7 @@ impl WgpuRendererCore {
         size: Size<DevicePixels>,
         premultiplied_alpha: bool,
         clear_color: wgpu::Color,
+        damage: Option<Bounds<ScaledPixels>>,
     ) -> Result<wgpu::SubmissionIndex> {
         anyhow::ensure!(
             size.width.0 > 0 && size.height.0 > 0,
@@ -1462,19 +1667,24 @@ impl WgpuRendererCore {
             bytemuck::bytes_of(&gamma_params),
         );
 
-        self.record_frame(scene, target_view, clear_color)
+        self.record_frame(scene, target_view, size, clear_color, damage)
             .inspect_err(|_| {
                 // Queue writes are staged before encoding; flush them even if the frame fails.
                 self.resources.queue.submit(std::iter::empty());
             })
     }
 
+    /// Record and submit `scene` into `frame_view`: all of it, or with
+    /// `damage`, only that region of it, over what the target already shows.
     fn record_frame(
         &mut self,
         scene: &Scene,
         frame_view: &wgpu::TextureView,
+        size: Size<DevicePixels>,
         clear_color: wgpu::Color,
+        damage: Option<Bounds<ScaledPixels>>,
     ) -> Result<wgpu::SubmissionIndex> {
+        let scissor = damage.map(|damage| scissor_rect(damage, size));
         let mut instance_offset = 0;
         let instance_bindings = self
             .write_instances(scene, &mut instance_offset)
@@ -1491,6 +1701,21 @@ impl WgpuRendererCore {
                 )
             })?;
         self.prepare_texture_bind_groups(scene);
+        // A damaged region is cleared before it is drawn again: one quad over
+        // it, written without blending.
+        let clear_binding = match damage {
+            Some(damage) => Some(self.write_instance_binding(
+                "clear_quad_bind_group",
+                &mut instance_offset,
+                &[Quad {
+                    bounds: damage,
+                    content_mask: ContentMask { bounds: damage },
+                    background: Hsla::transparent_black().into(),
+                    ..Default::default()
+                }],
+            )?),
+            None => None,
+        };
 
         let mut encoder =
             self.resources()
@@ -1499,6 +1724,25 @@ impl WgpuRendererCore {
                     label: Some("main_encoder"),
                 });
 
+        // Every path batch that overlaps no earlier one is rasterised up
+        // front, in one pass, so the main pass need not stop for it: on a
+        // tiling GPU each stop stores and reloads the whole frame. The first
+        // batch that overlaps one before it ends the run, as rasterising it
+        // clears the intermediate the rest would still be read from.
+        let leading_paths = leading_disjoint_path_batches(scene);
+        if !leading_paths.is_empty() {
+            let batches: SmallVec<[&[Path<ScaledPixels>]; 8]> = leading_paths
+                .iter()
+                .map(|range| &scene.paths[range.clone()])
+                .collect();
+            self.draw_paths_to_intermediate(
+                &mut encoder,
+                &batches,
+                &mut instance_offset,
+                scissor,
+            )?;
+        }
+
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main_pass"),
@@ -1506,7 +1750,11 @@ impl WgpuRendererCore {
                     view: frame_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color),
+                        load: if damage.is_some() {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(clear_color)
+                        },
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -1514,7 +1762,19 @@ impl WgpuRendererCore {
                 depth_stencil_attachment: None,
                 ..Default::default()
             });
+            if let Some([x, y, width, height]) = scissor {
+                pass.set_scissor_rect(x, y, width, height);
+            }
+            if let Some(binding) = &clear_binding {
+                self.draw_instances(
+                    binding,
+                    &self.resources().pipelines.quads_clear,
+                    0..1,
+                    &mut pass,
+                );
+            }
 
+            let mut path_batch = 0;
             for batch in scene.batches() {
                 match batch {
                     PrimitiveBatch::Quads(range) => self.draw_instances(
@@ -1523,6 +1783,9 @@ impl WgpuRendererCore {
                         instance_range(range),
                         &mut pass,
                     ),
+                    // Not in low power: soft shadows are a costly shader over
+                    // a wide area, and only decoration.
+                    PrimitiveBatch::Shadows(_) if self.low_power => {}
                     PrimitiveBatch::Shadows(range) => self.draw_instances(
                         &instance_bindings.shadows,
                         &self.resources().pipelines.shadows,
@@ -1534,12 +1797,23 @@ impl WgpuRendererCore {
                         if paths.is_empty() {
                             continue;
                         }
+                        let index = path_batch;
+                        path_batch += 1;
+                        if index < leading_paths.len() {
+                            self.draw_paths_from_intermediate(
+                                paths,
+                                &mut instance_offset,
+                                &mut pass,
+                            )?;
+                            continue;
+                        }
 
                         drop(pass);
                         let rasterized = self.draw_paths_to_intermediate(
                             &mut encoder,
-                            paths,
+                            &[paths],
                             &mut instance_offset,
+                            scissor,
                         )?;
 
                         pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1556,6 +1830,9 @@ impl WgpuRendererCore {
                             depth_stencil_attachment: None,
                             ..Default::default()
                         });
+                        if let Some([x, y, width, height]) = scissor {
+                            pass.set_scissor_rect(x, y, width, height);
+                        }
 
                         if rasterized {
                             self.draw_paths_from_intermediate(
@@ -1830,11 +2107,12 @@ impl WgpuRendererCore {
     fn draw_paths_to_intermediate(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
-        paths: &[Path<ScaledPixels>],
+        batches: &[&[Path<ScaledPixels>]],
         instance_offset: &mut u64,
+        scissor: Option<[u32; 4]>,
     ) -> Result<bool> {
         let mut vertices = Vec::new();
-        for path in paths {
+        for path in batches.iter().flat_map(|paths| paths.iter()) {
             let bounds = path.clipped_bounds();
             vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
                 xy_position: v.xy_position,
@@ -1881,6 +2159,9 @@ impl WgpuRendererCore {
                 ..Default::default()
             });
 
+            if let Some([x, y, width, height]) = scissor {
+                pass.set_scissor_rect(x, y, width, height);
+            }
             pass.set_pipeline(&resources.pipelines.path_rasterization);
             pass.set_bind_group(0, &resources.path_globals_bind_group, &[]);
             pass.set_bind_group(1, &vertex_binding.bind_group, &[]);
@@ -2259,6 +2540,7 @@ impl WgpuRenderer {
         self.atlas.handle_device_lost(context);
 
         let is_bgr = self.is_bgr;
+        let low_power = self.core().is_some_and(|core| core.low_power);
         *self = Self::new_internal(
             Some(gpu_context.clone()),
             context,
@@ -2268,6 +2550,7 @@ impl WgpuRenderer {
             self.atlas.clone(),
         )?;
         self.set_subpixel_layout(is_bgr);
+        self.set_low_power(low_power);
 
         log::info!("GPU recovery complete");
         Ok(())
@@ -2400,7 +2683,7 @@ impl WgpuHeadlessRenderer {
             .view
             .clone();
         self.core
-            .render_frame(scene, &view, size, false, wgpu::Color::BLACK)?;
+            .render_frame(scene, &view, size, false, wgpu::Color::BLACK, None)?;
         Ok(())
     }
 
@@ -2557,6 +2840,53 @@ fn create_surface(
             })
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
+}
+
+/// The path batches, from the first, that overlap no batch before them:
+/// what can be rasterised together before the main pass. A batch is drawn
+/// from the intermediate over the union of its paths' bounds when their
+/// orders differ, so that union is what must not overlap.
+fn leading_disjoint_path_batches(scene: &Scene) -> SmallVec<[Range<usize>; 8]> {
+    let mut leading = SmallVec::new();
+    let mut taken: SmallVec<[Bounds<ScaledPixels>; 8]> = SmallVec::new();
+    for batch in scene.batches() {
+        let PrimitiveBatch::Paths(range) = batch else {
+            continue;
+        };
+        let paths = &scene.paths[range.clone()];
+        let Some(first) = paths.first() else {
+            continue;
+        };
+        let reach = paths
+            .iter()
+            .skip(1)
+            .fold(first.clipped_bounds(), |reach, path| {
+                reach.union(&path.clipped_bounds())
+            });
+        if taken.iter().any(|earlier| earlier.intersects(&reach)) {
+            break;
+        }
+        taken.push(reach);
+        leading.push(range);
+    }
+    leading
+}
+
+/// `damage` as a scissor rectangle in whole pixels inside the target.
+fn scissor_rect(damage: Bounds<ScaledPixels>, size: Size<DevicePixels>) -> [u32; 4] {
+    let (target_width, target_height) = (size.width.0.max(0) as u32, size.height.0.max(0) as u32);
+    let x = damage.origin.x.0.floor().max(0.0) as u32;
+    let y = damage.origin.y.0.floor().max(0.0) as u32;
+    let right = (damage.origin.x.0 + damage.size.width.0).ceil().max(0.0) as u32;
+    let bottom = (damage.origin.y.0 + damage.size.height.0).ceil().max(0.0) as u32;
+    let x = x.min(target_width);
+    let y = y.min(target_height);
+    [
+        x,
+        y,
+        right.min(target_width).saturating_sub(x),
+        bottom.min(target_height).saturating_sub(y),
+    ]
 }
 
 struct RenderingParameters {
@@ -2919,5 +3249,88 @@ mod tests {
                 33.0_f32.to_bits(),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod path_pass_tests {
+    use super::*;
+    use gpui::{point, px, size};
+
+    fn everywhere() -> ContentMask<ScaledPixels> {
+        ContentMask {
+            bounds: Bounds {
+                origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
+                size: size(ScaledPixels(1000.0), ScaledPixels(1000.0)),
+            },
+        }
+    }
+
+    fn triangle(x: f32, y: f32) -> Path<ScaledPixels> {
+        let mut path = Path::new(point(px(x), px(y)));
+        path.line_to(point(px(x + 10.0), px(y)));
+        path.line_to(point(px(x), px(y + 10.0)));
+        let mut path = path.scale(1.0);
+        path.content_mask = everywhere();
+        path
+    }
+
+    fn cover(width: f32) -> Quad {
+        Quad {
+            bounds: Bounds {
+                origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
+                size: size(ScaledPixels(width), ScaledPixels(width)),
+            },
+            content_mask: everywhere(),
+            background: Hsla::white().into(),
+            ..Default::default()
+        }
+    }
+
+    fn leading(primitives: Vec<gpui::Primitive>) -> usize {
+        let mut scene = Scene::default();
+        for primitive in primitives {
+            scene.insert_primitive(primitive);
+        }
+        scene.finish();
+        leading_disjoint_path_batches(&scene).len()
+    }
+
+    #[test]
+    fn disjoint_path_batches_share_the_up_front_pass() {
+        // A quad between the paths keeps them in separate batches.
+        let count = leading(vec![
+            triangle(0.0, 0.0).into(),
+            cover(200.0).into(),
+            triangle(100.0, 100.0).into(),
+        ]);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn an_overlapping_path_batch_ends_the_run() {
+        let count = leading(vec![
+            triangle(0.0, 0.0).into(),
+            cover(200.0).into(),
+            triangle(100.0, 100.0).into(),
+            cover(300.0).into(),
+            triangle(2.0, 2.0).into(),
+            cover(400.0).into(),
+            triangle(150.0, 150.0).into(),
+        ]);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn a_damage_region_becomes_a_scissor_inside_the_target() {
+        let target = Size {
+            width: DevicePixels(100),
+            height: DevicePixels(50),
+        };
+        let damage = Bounds {
+            origin: point(ScaledPixels(10.4), ScaledPixels(-5.0)),
+            size: size(ScaledPixels(200.0), ScaledPixels(20.2)),
+        };
+        assert_eq!(scissor_rect(damage, target), [10, 0, 90, 16]);
     }
 }

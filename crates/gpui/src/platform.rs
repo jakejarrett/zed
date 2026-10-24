@@ -1262,6 +1262,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// themselves honor this (currently the Wayland backend); elsewhere it is
     /// a no-op.
     fn set_background_blur_corner_radius(&self, _radius: Pixels) {}
+    /// Draw for a slow GPU: cheaper multisampling, no shadows, and only the
+    /// part of the window that changed. Honored by the wgpu renderer (Linux);
+    /// elsewhere a no-op.
+    fn set_low_power_rendering(&self, _enabled: bool) {}
     fn minimize(&self);
     fn zoom(&self);
     fn toggle_fullscreen(&self);

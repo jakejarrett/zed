@@ -3102,6 +3102,13 @@ impl Window {
             .set_background_blur_corner_radius(radius);
     }
 
+    /// Draws this window for a slow GPU: cheaper multisampling of paths, no
+    /// shadows, and only the part that changed since the last frame. Only the
+    /// wgpu renderer (Linux) honors it.
+    pub fn set_low_power_rendering(&self, enabled: bool) {
+        self.platform_window.set_low_power_rendering(enabled);
+    }
+
     /// Mark the window as dirty at the platform level.
     pub fn set_window_edited(&mut self, edited: bool) {
         self.platform_window.set_edited(edited);

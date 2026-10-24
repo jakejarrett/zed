@@ -1,4 +1,5 @@
 mod cosmic_text_system;
+mod damage;
 mod wgpu_atlas;
 mod wgpu_context;
 mod wgpu_renderer;

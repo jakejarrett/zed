@@ -1946,6 +1946,15 @@ impl PlatformWindow for WaylandWindow {
         self.0.request_redraw();
     }
 
+    fn set_low_power_rendering(&self, enabled: bool) {
+        let mut state = self.borrow_mut();
+        if let Some(renderer) = &mut state.renderer {
+            renderer.set_low_power(enabled);
+        }
+        drop(state);
+        self.0.request_redraw();
+    }
+
     fn set_background_blur_corner_radius(&self, radius: Pixels) {
         let mut state = self.borrow_mut();
         if state.blur_corner_radius != radius {
