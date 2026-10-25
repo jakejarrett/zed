@@ -1751,11 +1751,8 @@ impl WgpuRendererCore {
         // tiling GPU each stop stores and reloads the whole frame. The first
         // batch that overlaps one before it ends the run, as rasterising it
         // clears the intermediate the rest would still be read from.
-        let leading_paths = leading_disjoint_path_batches(scene);
-        let path_batches = scene
-            .batches()
-            .filter(|batch| matches!(batch, PrimitiveBatch::Paths(range) if !range.is_empty()))
-            .count();
+        let path_plans = plan_path_batches(scene, damage);
+        let any_alone = path_plans.iter().any(|(plan, _)| *plan == PathPlan::Alone);
         // Each damaged region draws the scene again under its own scissor,
         // all in the one pass; a path batch that has to stop the pass can only
         // be drawn under one, so then the regions are drawn as their union.
@@ -1763,7 +1760,7 @@ impl WgpuRendererCore {
             .map(|damage| damage.iter().copied().collect())
             .unwrap_or_default();
         let union = regions.iter().copied().reduce(|a, b| a.union(&b));
-        if regions.len() > 1 && leading_paths.len() < path_batches {
+        if regions.len() > 1 && any_alone {
             regions = union.into_iter().collect();
         }
         let union_scissor = union.map(|union| scissor_rect(union, size));
@@ -1819,14 +1816,20 @@ impl WgpuRendererCore {
                     label: Some("main_encoder"),
                 });
 
-        if !leading_paths.is_empty() {
-            let batches: SmallVec<[&[Path<ScaledPixels>]; 8]> = leading_paths
-                .iter()
-                .map(|range| &scene.paths[range.clone()])
-                .collect();
+        let ahead: SmallVec<[&[Path<ScaledPixels>]; 8]> = scene
+            .batches()
+            .filter_map(|batch| match batch {
+                PrimitiveBatch::Paths(range) if !range.is_empty() => Some(range),
+                _ => None,
+            })
+            .zip(&path_plans)
+            .filter(|(_, (plan, _))| *plan == PathPlan::Ahead)
+            .map(|(range, _)| &scene.paths[range])
+            .collect();
+        if !ahead.is_empty() {
             self.draw_paths_to_intermediate(
                 &mut encoder,
-                &batches,
+                &ahead,
                 &mut instance_offset,
                 union_scissor,
             )?;
@@ -1887,15 +1890,19 @@ impl WgpuRendererCore {
                             if paths.is_empty() {
                                 continue;
                             }
-                            let index = path_batch;
+                            let (plan, footprint) = &path_plans[path_batch];
                             path_batch += 1;
-                            if index < leading_paths.len() {
-                                self.draw_paths_from_intermediate(
-                                    paths,
-                                    &mut instance_offset,
-                                    &mut pass,
-                                )?;
-                                continue;
+                            match plan {
+                                PathPlan::Skip => continue,
+                                PathPlan::Ahead => {
+                                    self.draw_paths_from_intermediate(
+                                        footprint,
+                                        &mut instance_offset,
+                                        &mut pass,
+                                    )?;
+                                    continue;
+                                }
+                                PathPlan::Alone => {}
                             }
 
                             drop(pass);
@@ -1926,7 +1933,7 @@ impl WgpuRendererCore {
 
                             if rasterized {
                                 self.draw_paths_from_intermediate(
-                                    paths,
+                                    footprint,
                                     &mut instance_offset,
                                     &mut pass,
                                 )?;
@@ -2151,28 +2158,18 @@ impl WgpuRendererCore {
         }
     }
 
+    /// Composite a path batch from the intermediate over its footprint
+    /// ([`path_footprint`]).
     fn draw_paths_from_intermediate(
         &mut self,
-        paths: &[Path<ScaledPixels>],
+        footprint: &[Bounds<ScaledPixels>],
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> Result<()> {
-        let first_path = &paths[0];
-        let sprites: Vec<PathSprite> = if paths.last().map(|p| &p.order) == Some(&first_path.order)
-        {
-            paths
-                .iter()
-                .map(|p| PathSprite {
-                    bounds: p.clipped_bounds(),
-                })
-                .collect()
-        } else {
-            let mut bounds = first_path.clipped_bounds();
-            for path in paths.iter().skip(1) {
-                bounds = bounds.union(&path.clipped_bounds());
-            }
-            vec![PathSprite { bounds }]
-        };
+        let sprites: Vec<PathSprite> = footprint
+            .iter()
+            .map(|bounds| PathSprite { bounds: *bounds })
+            .collect();
 
         let Some(path_intermediate_view) = self.resources().path_intermediate_view.clone() else {
             return Ok(());
@@ -2933,34 +2930,86 @@ fn create_surface(
     }
 }
 
-/// The path batches, from the first, that overlap no batch before them:
-/// what can be rasterised together before the main pass. A batch is drawn
-/// from the intermediate over the union of its paths' bounds when their
-/// orders differ, so that union is what must not overlap.
-fn leading_disjoint_path_batches(scene: &Scene) -> SmallVec<[Range<usize>; 8]> {
-    let mut leading = SmallVec::new();
-    let mut taken: SmallVec<[Bounds<ScaledPixels>; 8]> = SmallVec::new();
+/// What a path batch covers when drawn from the intermediate: each path's
+/// bounds when they do not overlap one another, else their union (a batch
+/// whose paths overlap is composited as one rectangle, so that no pixel of
+/// the intermediate is drawn twice).
+fn path_footprint(paths: &[Path<ScaledPixels>]) -> SmallVec<[Bounds<ScaledPixels>; 4]> {
+    let bounds: SmallVec<[Bounds<ScaledPixels>; 4]> =
+        paths.iter().map(|path| path.clipped_bounds()).collect();
+    // Paths sharing a draw order never overlap; past a few dozen, checking
+    // every pair costs more than it saves.
+    let same_order = paths.first().map(|p| p.order) == paths.last().map(|p| p.order);
+    let disjoint = same_order
+        || (bounds.len() <= 64
+            && bounds
+                .iter()
+                .enumerate()
+                .all(|(i, a)| bounds[i + 1..].iter().all(|b| !a.intersects(b))));
+    if disjoint {
+        bounds
+    } else {
+        bounds
+            .into_iter()
+            .reduce(|a, b| a.union(&b))
+            .into_iter()
+            .collect()
+    }
+}
+
+/// How a path batch is drawn this frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PathPlan {
+    /// Outside every damaged region: not drawn at all.
+    Skip,
+    /// Rasterised with the others before the main pass, composited in it.
+    Ahead,
+    /// Overlaps a batch before it: rasterised on its own, stopping the main
+    /// pass, as rasterising it clears the intermediate the others are read
+    /// from. Every batch after the first of these is drawn this way too.
+    Alone,
+}
+
+/// The plan for each non-empty path batch, in draw order, and each one's
+/// footprint. With `damage`, a batch none of whose footprint touches it is
+/// skipped.
+fn plan_path_batches(
+    scene: &Scene,
+    damage: Option<&[Bounds<ScaledPixels>]>,
+) -> Vec<(PathPlan, SmallVec<[Bounds<ScaledPixels>; 4]>)> {
+    let mut plans = Vec::new();
+    let mut taken: Vec<Bounds<ScaledPixels>> = Vec::new();
+    let mut alone = false;
     for batch in scene.batches() {
         let PrimitiveBatch::Paths(range) = batch else {
             continue;
         };
-        let paths = &scene.paths[range.clone()];
-        let Some(first) = paths.first() else {
+        let paths = &scene.paths[range];
+        if paths.is_empty() {
             continue;
-        };
-        let reach = paths
-            .iter()
-            .skip(1)
-            .fold(first.clipped_bounds(), |reach, path| {
-                reach.union(&path.clipped_bounds())
-            });
-        if taken.iter().any(|earlier| earlier.intersects(&reach)) {
-            break;
         }
-        taken.push(reach);
-        leading.push(range);
+        let footprint = path_footprint(paths);
+        let damaged = damage.is_none_or(|regions| {
+            footprint
+                .iter()
+                .any(|bounds| regions.iter().any(|region| region.intersects(bounds)))
+        });
+        let plan = if !damaged {
+            PathPlan::Skip
+        } else if alone
+            || footprint
+                .iter()
+                .any(|bounds| taken.iter().any(|earlier| earlier.intersects(bounds)))
+        {
+            alone = true;
+            PathPlan::Alone
+        } else {
+            taken.extend(footprint.iter().copied());
+            PathPlan::Ahead
+        };
+        plans.push((plan, footprint));
     }
-    leading
+    plans
 }
 
 /// Path multisampling in low power mode: 2x where the format supports it,
@@ -3398,7 +3447,10 @@ mod path_pass_tests {
             scene.insert_primitive(primitive);
         }
         scene.finish();
-        leading_disjoint_path_batches(&scene).len()
+        plan_path_batches(&scene, None)
+            .iter()
+            .take_while(|(plan, _)| *plan == PathPlan::Ahead)
+            .count()
     }
 
     #[test]
@@ -3424,6 +3476,39 @@ mod path_pass_tests {
             triangle(150.0, 150.0).into(),
         ]);
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn separate_paths_of_different_orders_keep_their_own_footprints() {
+        let mut a = triangle(0.0, 0.0);
+        let mut b = triangle(100.0, 100.0);
+        a.order = 1;
+        b.order = 2;
+        assert_eq!(path_footprint(&[a.clone(), b.clone()]).len(), 2);
+        // Overlapping paths of different orders are composited as one.
+        let mut c = triangle(2.0, 2.0);
+        c.order = 3;
+        let footprint = path_footprint(&[a, c]);
+        assert_eq!(footprint.len(), 1);
+    }
+
+    #[test]
+    fn paths_outside_the_damage_are_skipped() {
+        let mut scene = Scene::default();
+        // The quad between them keeps the paths in separate batches.
+        scene.insert_primitive(triangle(0.0, 0.0));
+        scene.insert_primitive(cover(400.0));
+        scene.insert_primitive(triangle(300.0, 300.0));
+        scene.finish();
+        let damage = [Bounds {
+            origin: point(ScaledPixels(295.0), ScaledPixels(295.0)),
+            size: size(ScaledPixels(20.0), ScaledPixels(20.0)),
+        }];
+        let plans: Vec<PathPlan> = plan_path_batches(&scene, Some(&damage))
+            .into_iter()
+            .map(|(plan, _)| plan)
+            .collect();
+        assert_eq!(plans, vec![PathPlan::Skip, PathPlan::Ahead]);
     }
 
     #[test]
