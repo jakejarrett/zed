@@ -1342,7 +1342,12 @@ impl WgpuRendererCore {
         if let Some(samples) = std::env::var("GPUI_PATH_SAMPLES")
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
-            .filter(|samples| *samples <= full_path_sample_count && samples.is_power_of_two())
+            .filter(|samples| {
+                *samples <= full_path_sample_count
+                    && rendering_params
+                        .path_sample_support
+                        .sample_count_supported(*samples)
+            })
         {
             rendering_params.path_sample_count = samples;
         }
@@ -1547,7 +1552,10 @@ impl WgpuRendererCore {
         self.low_power = enabled;
         self.last_digest = None;
         let samples = if enabled {
-            self.full_path_sample_count.min(2)
+            low_power_path_samples(
+                self.full_path_sample_count,
+                self.rendering_params.path_sample_support,
+            )
         } else {
             self.full_path_sample_count
         };
@@ -2872,6 +2880,17 @@ fn leading_disjoint_path_batches(scene: &Scene) -> SmallVec<[Range<usize>; 8]> {
     leading
 }
 
+/// Path multisampling in low power mode: 2x where the format supports it,
+/// else the usual count. Some GPUs offer only 1x and 4x (the Raspberry Pi 5's
+/// V3D), and 1x is a coarser look than low power promises.
+fn low_power_path_samples(full: u32, support: wgpu::TextureFormatFeatureFlags) -> u32 {
+    if full > 2 && support.sample_count_supported(2) {
+        2
+    } else {
+        full
+    }
+}
+
 /// `damage` as a scissor rectangle in whole pixels inside the target.
 fn scissor_rect(damage: Bounds<ScaledPixels>, size: Size<DevicePixels>) -> [u32; 4] {
     let (target_width, target_height) = (size.width.0.max(0) as u32, size.height.0.max(0) as u32);
@@ -2891,6 +2910,8 @@ fn scissor_rect(damage: Bounds<ScaledPixels>, size: Size<DevicePixels>) -> [u32;
 
 struct RenderingParameters {
     path_sample_count: u32,
+    /// The sample counts the target format supports for path rasterisation.
+    path_sample_support: wgpu::TextureFormatFeatureFlags,
     gamma_ratios: [f32; 4],
     grayscale_enhanced_contrast: f32,
     subpixel_enhanced_contrast: f32,
@@ -2927,6 +2948,7 @@ impl RenderingParameters {
 
         Self {
             path_sample_count,
+            path_sample_support: format_features.flags,
             gamma_ratios,
             grayscale_enhanced_contrast,
             subpixel_enhanced_contrast,
@@ -3319,6 +3341,18 @@ mod path_pass_tests {
             triangle(150.0, 150.0).into(),
         ]);
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn low_power_multisampling_is_one_the_format_supports() {
+        use wgpu::TextureFormatFeatureFlags as Flags;
+        assert_eq!(
+            low_power_path_samples(4, Flags::MULTISAMPLE_X2 | Flags::MULTISAMPLE_X4),
+            2
+        );
+        // The Pi 5's V3D: 1x and 4x only.
+        assert_eq!(low_power_path_samples(4, Flags::MULTISAMPLE_X4), 4);
+        assert_eq!(low_power_path_samples(1, Flags::empty()), 1);
     }
 
     #[test]
