@@ -242,6 +242,56 @@ struct WgpuRendererCore {
     damage_redraw_override: Option<bool>,
     /// What the kept frame (`damage_target`) shows, to compare the next with.
     last_digest: Option<FrameDigest>,
+    /// `GPUI_DAMAGE_DEBUG=1`: how much damage redraw saves, logged.
+    damage_stats: Option<DamageStats>,
+}
+
+/// How damage redraw went over the last frames: logged every
+/// [`DamageStats::EVERY`] frames when `GPUI_DAMAGE_DEBUG` is set.
+#[derive(Default)]
+struct DamageStats {
+    frames: u32,
+    full: u32,
+    unchanged: u32,
+    regions: u32,
+    /// Share of the window drawn, summed over the frames.
+    drawn: f32,
+}
+
+impl DamageStats {
+    const EVERY: u32 = 300;
+
+    fn record(&mut self, damage: &Damage, size: Size<DevicePixels>) {
+        self.frames += 1;
+        match damage {
+            Damage::Full => {
+                self.full += 1;
+                self.drawn += 1.0;
+            }
+            Damage::None => self.unchanged += 1,
+            Damage::Regions(regions) => {
+                self.regions += regions.len() as u32;
+                let window = (size.width.0 as f32 * size.height.0 as f32).max(1.0);
+                self.drawn += regions
+                    .iter()
+                    .map(|region| region.size.width.0 * region.size.height.0)
+                    .sum::<f32>()
+                    / window;
+            }
+        }
+        if self.frames >= Self::EVERY {
+            let partial = (self.frames - self.full - self.unchanged).max(1);
+            log::info!(
+                "damage redraw: {} frames, {} whole, {} unchanged, {:.1} regions a partial frame, {:.0}% of the window drawn on average",
+                self.frames,
+                self.full,
+                self.unchanged,
+                self.regions as f32 / partial as f32,
+                self.drawn / self.frames as f32 * 100.0,
+            );
+            *self = Self::default();
+        }
+    }
 }
 
 /// GPU resources of a windowed renderer. A surface is only ever configured against the
@@ -470,9 +520,7 @@ impl WgpuRenderer {
             );
         }
 
-        let surface_copy_dst = surface_caps
-            .usages
-            .contains(wgpu::TextureUsages::COPY_DST);
+        let surface_copy_dst = surface_caps.usages.contains(wgpu::TextureUsages::COPY_DST);
         let surface_config = wgpu::SurfaceConfiguration {
             usage: if surface_copy_dst {
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST
@@ -1257,19 +1305,22 @@ impl WgpuRenderer {
             } else {
                 digest.damage_since(core.last_digest.as_ref())
             };
+            if let Some(stats) = core.damage_stats.as_mut() {
+                stats.record(&damage, size);
+            }
             let Some((target, target_view)) = core.resources.damage_target.clone() else {
                 return false;
             };
             let drawn = match damage {
                 Damage::None => Ok(()),
-                Damage::Region(region) => core
+                Damage::Regions(regions) => core
                     .render_frame(
                         scene,
                         &target_view,
                         size,
                         premultiplied_alpha,
                         wgpu::Color::TRANSPARENT,
-                        Some(region),
+                        Some(&regions),
                     )
                     .map(drop),
                 Damage::Full => core
@@ -1304,7 +1355,9 @@ impl WgpuRenderer {
                     depth_or_array_layers: 1,
                 },
             );
-            core.resources.queue.submit(std::iter::once(encoder.finish()));
+            core.resources
+                .queue
+                .submit(std::iter::once(encoder.finish()));
             core.resources.queue.present(frame);
             return true;
         }
@@ -1503,6 +1556,7 @@ impl WgpuRendererCore {
                 .ok()
                 .map(|value| value != "0"),
             last_digest: None,
+            damage_stats: std::env::var_os("GPUI_DAMAGE_DEBUG").map(|_| DamageStats::default()),
         }
     }
 
@@ -1627,7 +1681,7 @@ impl WgpuRendererCore {
         size: Size<DevicePixels>,
         premultiplied_alpha: bool,
         clear_color: wgpu::Color,
-        damage: Option<Bounds<ScaledPixels>>,
+        damage: Option<&[Bounds<ScaledPixels>]>,
     ) -> Result<wgpu::SubmissionIndex> {
         anyhow::ensure!(
             size.width.0 > 0 && size.height.0 > 0,
@@ -1683,16 +1737,44 @@ impl WgpuRendererCore {
     }
 
     /// Record and submit `scene` into `frame_view`: all of it, or with
-    /// `damage`, only that region of it, over what the target already shows.
+    /// `damage`, only those regions of it, over what the target already shows.
     fn record_frame(
         &mut self,
         scene: &Scene,
         frame_view: &wgpu::TextureView,
         size: Size<DevicePixels>,
         clear_color: wgpu::Color,
-        damage: Option<Bounds<ScaledPixels>>,
+        damage: Option<&[Bounds<ScaledPixels>]>,
     ) -> Result<wgpu::SubmissionIndex> {
-        let scissor = damage.map(|damage| scissor_rect(damage, size));
+        // Every path batch that overlaps no earlier one is rasterised up
+        // front, in one pass, so the main pass need not stop for it: on a
+        // tiling GPU each stop stores and reloads the whole frame. The first
+        // batch that overlaps one before it ends the run, as rasterising it
+        // clears the intermediate the rest would still be read from.
+        let leading_paths = leading_disjoint_path_batches(scene);
+        let path_batches = scene
+            .batches()
+            .filter(|batch| matches!(batch, PrimitiveBatch::Paths(range) if !range.is_empty()))
+            .count();
+        // Each damaged region draws the scene again under its own scissor,
+        // all in the one pass; a path batch that has to stop the pass can only
+        // be drawn under one, so then the regions are drawn as their union.
+        let mut regions: SmallVec<[Bounds<ScaledPixels>; 8]> = damage
+            .map(|damage| damage.iter().copied().collect())
+            .unwrap_or_default();
+        let union = regions.iter().copied().reduce(|a, b| a.union(&b));
+        if regions.len() > 1 && leading_paths.len() < path_batches {
+            regions = union.into_iter().collect();
+        }
+        let union_scissor = union.map(|union| scissor_rect(union, size));
+        let scissors: SmallVec<[Option<[u32; 4]>; 8]> = if regions.is_empty() {
+            SmallVec::from_elem(None, 1)
+        } else {
+            regions
+                .iter()
+                .map(|region| Some(scissor_rect(*region, size)))
+                .collect()
+        };
         let mut instance_offset = 0;
         let instance_bindings = self
             .write_instances(scene, &mut instance_offset)
@@ -1711,18 +1793,23 @@ impl WgpuRendererCore {
         self.prepare_texture_bind_groups(scene);
         // A damaged region is cleared before it is drawn again: one quad over
         // it, written without blending.
-        let clear_binding = match damage {
-            Some(damage) => Some(self.write_instance_binding(
+        let clear_quads: SmallVec<[Quad; 8]> = regions
+            .iter()
+            .map(|region| Quad {
+                bounds: *region,
+                content_mask: ContentMask { bounds: *region },
+                background: Hsla::transparent_black().into(),
+                ..Default::default()
+            })
+            .collect();
+        let clear_binding = if clear_quads.is_empty() {
+            None
+        } else {
+            Some(self.write_instance_binding(
                 "clear_quad_bind_group",
                 &mut instance_offset,
-                &[Quad {
-                    bounds: damage,
-                    content_mask: ContentMask { bounds: damage },
-                    background: Hsla::transparent_black().into(),
-                    ..Default::default()
-                }],
-            )?),
-            None => None,
+                &clear_quads,
+            )?)
         };
 
         let mut encoder =
@@ -1732,12 +1819,6 @@ impl WgpuRendererCore {
                     label: Some("main_encoder"),
                 });
 
-        // Every path batch that overlaps no earlier one is rasterised up
-        // front, in one pass, so the main pass need not stop for it: on a
-        // tiling GPU each stop stores and reloads the whole frame. The first
-        // batch that overlaps one before it ends the run, as rasterising it
-        // clears the intermediate the rest would still be read from.
-        let leading_paths = leading_disjoint_path_batches(scene);
         if !leading_paths.is_empty() {
             let batches: SmallVec<[&[Path<ScaledPixels>]; 8]> = leading_paths
                 .iter()
@@ -1747,7 +1828,7 @@ impl WgpuRendererCore {
                 &mut encoder,
                 &batches,
                 &mut instance_offset,
-                scissor,
+                union_scissor,
             )?;
         }
 
@@ -1770,127 +1851,129 @@ impl WgpuRendererCore {
                 depth_stencil_attachment: None,
                 ..Default::default()
             });
-            if let Some([x, y, width, height]) = scissor {
-                pass.set_scissor_rect(x, y, width, height);
-            }
-            if let Some(binding) = &clear_binding {
-                self.draw_instances(
-                    binding,
-                    &self.resources().pipelines.quads_clear,
-                    0..1,
-                    &mut pass,
-                );
-            }
+            for (region, scissor) in scissors.iter().copied().enumerate() {
+                if let Some([x, y, width, height]) = scissor {
+                    pass.set_scissor_rect(x, y, width, height);
+                }
+                if let Some(binding) = &clear_binding {
+                    self.draw_instances(
+                        binding,
+                        &self.resources().pipelines.quads_clear,
+                        region as u32..region as u32 + 1,
+                        &mut pass,
+                    );
+                }
 
-            let mut path_batch = 0;
-            for batch in scene.batches() {
-                match batch {
-                    PrimitiveBatch::Quads(range) => self.draw_instances(
-                        &instance_bindings.quads,
-                        &self.resources().pipelines.quads,
-                        instance_range(range),
-                        &mut pass,
-                    ),
-                    // Not in low power: soft shadows are a costly shader over
-                    // a wide area, and only decoration.
-                    PrimitiveBatch::Shadows(_) if self.low_power => {}
-                    PrimitiveBatch::Shadows(range) => self.draw_instances(
-                        &instance_bindings.shadows,
-                        &self.resources().pipelines.shadows,
-                        instance_range(range),
-                        &mut pass,
-                    ),
-                    PrimitiveBatch::Paths(range) => {
-                        let paths = &scene.paths[range];
-                        if paths.is_empty() {
-                            continue;
-                        }
-                        let index = path_batch;
-                        path_batch += 1;
-                        if index < leading_paths.len() {
-                            self.draw_paths_from_intermediate(
-                                paths,
+                let mut path_batch = 0;
+                for batch in scene.batches() {
+                    match batch {
+                        PrimitiveBatch::Quads(range) => self.draw_instances(
+                            &instance_bindings.quads,
+                            &self.resources().pipelines.quads,
+                            instance_range(range),
+                            &mut pass,
+                        ),
+                        // Not in low power: soft shadows are a costly shader over
+                        // a wide area, and only decoration.
+                        PrimitiveBatch::Shadows(_) if self.low_power => {}
+                        PrimitiveBatch::Shadows(range) => self.draw_instances(
+                            &instance_bindings.shadows,
+                            &self.resources().pipelines.shadows,
+                            instance_range(range),
+                            &mut pass,
+                        ),
+                        PrimitiveBatch::Paths(range) => {
+                            let paths = &scene.paths[range];
+                            if paths.is_empty() {
+                                continue;
+                            }
+                            let index = path_batch;
+                            path_batch += 1;
+                            if index < leading_paths.len() {
+                                self.draw_paths_from_intermediate(
+                                    paths,
+                                    &mut instance_offset,
+                                    &mut pass,
+                                )?;
+                                continue;
+                            }
+
+                            drop(pass);
+                            let rasterized = self.draw_paths_to_intermediate(
+                                &mut encoder,
+                                &[paths],
                                 &mut instance_offset,
+                                union_scissor,
+                            )?;
+
+                            pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("main_pass_continued"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: frame_view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                ..Default::default()
+                            });
+                            if let Some([x, y, width, height]) = scissor {
+                                pass.set_scissor_rect(x, y, width, height);
+                            }
+
+                            if rasterized {
+                                self.draw_paths_from_intermediate(
+                                    paths,
+                                    &mut instance_offset,
+                                    &mut pass,
+                                )?;
+                            }
+                        }
+                        PrimitiveBatch::Underlines(range) => self.draw_instances(
+                            &instance_bindings.underlines,
+                            &self.resources().pipelines.underlines,
+                            instance_range(range),
+                            &mut pass,
+                        ),
+                        PrimitiveBatch::MonochromeSprites { texture_id, range } => {
+                            self.draw_sprites(
+                                &instance_bindings.monochrome_sprites,
+                                texture_id,
+                                &self.resources().pipelines.mono_sprites,
+                                instance_range(range),
                                 &mut pass,
                             )?;
-                            continue;
                         }
-
-                        drop(pass);
-                        let rasterized = self.draw_paths_to_intermediate(
-                            &mut encoder,
-                            &[paths],
-                            &mut instance_offset,
-                            scissor,
-                        )?;
-
-                        pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("main_pass_continued"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: frame_view,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Load,
-                                    store: wgpu::StoreOp::Store,
-                                },
-                                depth_slice: None,
-                            })],
-                            depth_stencil_attachment: None,
-                            ..Default::default()
-                        });
-                        if let Some([x, y, width, height]) = scissor {
-                            pass.set_scissor_rect(x, y, width, height);
-                        }
-
-                        if rasterized {
-                            self.draw_paths_from_intermediate(
-                                paths,
-                                &mut instance_offset,
+                        PrimitiveBatch::SubpixelSprites { texture_id, range } => {
+                            let resources = self.resources();
+                            self.draw_sprites(
+                                &instance_bindings.subpixel_sprites,
+                                texture_id,
+                                resources
+                                    .pipelines
+                                    .subpixel_sprites
+                                    .as_ref()
+                                    .unwrap_or(&resources.pipelines.mono_sprites),
+                                instance_range(range),
                                 &mut pass,
                             )?;
                         }
+                        PrimitiveBatch::PolychromeSprites { texture_id, range } => {
+                            self.draw_sprites(
+                                &instance_bindings.polychrome_sprites,
+                                texture_id,
+                                &self.resources().pipelines.poly_sprites,
+                                instance_range(range),
+                                &mut pass,
+                            )?;
+                        }
+                        // Surfaces are macOS-only for video playback and are not
+                        // implemented by the WGPU renderer.
+                        PrimitiveBatch::Surfaces(_surfaces) => {}
                     }
-                    PrimitiveBatch::Underlines(range) => self.draw_instances(
-                        &instance_bindings.underlines,
-                        &self.resources().pipelines.underlines,
-                        instance_range(range),
-                        &mut pass,
-                    ),
-                    PrimitiveBatch::MonochromeSprites { texture_id, range } => {
-                        self.draw_sprites(
-                            &instance_bindings.monochrome_sprites,
-                            texture_id,
-                            &self.resources().pipelines.mono_sprites,
-                            instance_range(range),
-                            &mut pass,
-                        )?;
-                    }
-                    PrimitiveBatch::SubpixelSprites { texture_id, range } => {
-                        let resources = self.resources();
-                        self.draw_sprites(
-                            &instance_bindings.subpixel_sprites,
-                            texture_id,
-                            resources
-                                .pipelines
-                                .subpixel_sprites
-                                .as_ref()
-                                .unwrap_or(&resources.pipelines.mono_sprites),
-                            instance_range(range),
-                            &mut pass,
-                        )?;
-                    }
-                    PrimitiveBatch::PolychromeSprites { texture_id, range } => {
-                        self.draw_sprites(
-                            &instance_bindings.polychrome_sprites,
-                            texture_id,
-                            &self.resources().pipelines.poly_sprites,
-                            instance_range(range),
-                            &mut pass,
-                        )?;
-                    }
-                    // Surfaces are macOS-only for video playback and are not
-                    // implemented by the WGPU renderer.
-                    PrimitiveBatch::Surfaces(_surfaces) => {}
                 }
             }
         }

@@ -5,13 +5,16 @@
 //! primitive renumbers every later one without changing how they look), and
 //! the two frames' hashes are compared as multisets. The damage is the union
 //! of the bounds of the primitives only one frame has: where something
-//! appeared, disappeared or moved.
+//! appeared, disappeared or moved. It is kept as a few separate regions, as
+//! a playhead at the top of the window and a meter at the bottom would
+//! otherwise be one rectangle over nearly all of it.
 
 use collections::FxHasher;
 use gpui::{
     Bounds, DevicePixels, MonochromeSprite, Path, PolychromeSprite, Quad, ScaledPixels, Scene,
     Shadow, Size, SubpixelSprite, TransformationMatrix, Underline, point, size,
 };
+use smallvec::SmallVec;
 use std::hash::Hasher;
 
 // Hashing skips the leading `order` field of each primitive.
@@ -28,6 +31,16 @@ const _: () = {
 /// the damage, and skips the bookkeeping of a partial frame.
 const FULL_SHARE: f32 = 0.6;
 
+/// The most regions a frame is drawn in; each one draws the scene again
+/// under its own scissor, so past a few the repeated draws cost more than
+/// the pixels they save.
+pub(crate) const MAX_REGIONS: usize = 8;
+
+/// Changes nearer than this are drawn as one region.
+const MERGE_GAP: f32 = 24.0;
+
+pub(crate) type Regions = SmallVec<[Bounds<ScaledPixels>; MAX_REGIONS]>;
+
 /// What one frame drew, reduced to what comparing frames needs.
 pub(crate) struct FrameDigest {
     size: Size<DevicePixels>,
@@ -41,8 +54,9 @@ pub(crate) struct FrameDigest {
 pub(crate) enum Damage {
     /// Nothing looks different.
     None,
-    /// Draw again inside these bounds, in device pixels.
-    Region(Bounds<ScaledPixels>),
+    /// Draw again inside these regions, in device pixels. They do not
+    /// overlap.
+    Regions(Regions),
     /// Draw everything.
     Full,
 }
@@ -82,13 +96,21 @@ impl FrameDigest {
         for sprite in &scene.monochrome_sprites {
             entries.push((
                 hash_after_order(3, sprite),
-                sprite_reach(sprite.bounds, &sprite.transformation, sprite.content_mask.bounds),
+                sprite_reach(
+                    sprite.bounds,
+                    &sprite.transformation,
+                    sprite.content_mask.bounds,
+                ),
             ));
         }
         for sprite in &scene.subpixel_sprites {
             entries.push((
                 hash_after_order(4, sprite),
-                sprite_reach(sprite.bounds, &sprite.transformation, sprite.content_mask.bounds),
+                sprite_reach(
+                    sprite.bounds,
+                    &sprite.transformation,
+                    sprite.content_mask.bounds,
+                ),
             ));
         }
         for sprite in &scene.polychrome_sprites {
@@ -116,19 +138,26 @@ impl FrameDigest {
         if previous.size != self.size || self.has_surfaces || previous.has_surfaces {
             return Damage::Full;
         }
-        let mut damage: Option<Bounds<ScaledPixels>> = None;
+        let viewport = Bounds {
+            origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size: size(
+                ScaledPixels(self.size.width.0 as f32),
+                ScaledPixels(self.size.height.0 as f32),
+            ),
+        };
+        let mut changed: Vec<Bounds<ScaledPixels>> = Vec::new();
         let mut add = |bounds: Bounds<ScaledPixels>| {
-            if bounds.size.width.0 <= 0.0 || bounds.size.height.0 <= 0.0 {
-                return;
+            let bounds = bounds.intersect(&viewport);
+            if bounds.size.width.0 > 0.0 && bounds.size.height.0 > 0.0 {
+                changed.push(bounds);
             }
-            damage = Some(match damage {
-                Some(damage) => damage.union(&bounds),
-                None => bounds,
-            });
         };
         // Both are sorted by hash: walk them together, letting equal hashes
         // cancel one for one.
-        let (mut old, mut new) = (previous.entries.iter().peekable(), self.entries.iter().peekable());
+        let (mut old, mut new) = (
+            previous.entries.iter().peekable(),
+            self.entries.iter().peekable(),
+        );
         loop {
             match (old.peek(), new.peek()) {
                 (Some((a, a_bounds)), Some((b, b_bounds))) => {
@@ -154,27 +183,77 @@ impl FrameDigest {
                 (None, None) => break,
             }
         }
-        let viewport = Bounds {
-            origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
-            size: size(
-                ScaledPixels(self.size.width.0 as f32),
-                ScaledPixels(self.size.height.0 as f32),
-            ),
-        };
-        let Some(damage) = damage.map(|damage| damage.intersect(&viewport)) else {
-            return Damage::None;
-        };
-        if damage.size.width.0 <= 0.0 || damage.size.height.0 <= 0.0 {
+        if changed.is_empty() {
             return Damage::None;
         }
-        let share = (damage.size.width.0 * damage.size.height.0)
-            / (viewport.size.width.0 * viewport.size.height.0).max(1.0);
-        if share > FULL_SHARE {
+        let regions = merge_regions(changed);
+        let area: f32 = regions.iter().map(area).sum();
+        if area / area_of(viewport.size).max(1.0) > FULL_SHARE {
             Damage::Full
         } else {
-            Damage::Region(damage)
+            Damage::Regions(regions)
         }
     }
+}
+
+/// `changed` as at most [`MAX_REGIONS`] regions that do not overlap: changes
+/// near each other joined, then the pairs whose join adds least area until
+/// few enough are left.
+fn merge_regions(changed: Vec<Bounds<ScaledPixels>>) -> Regions {
+    let near = |a: &Bounds<ScaledPixels>, b: &Bounds<ScaledPixels>| {
+        a.dilate(ScaledPixels(MERGE_GAP)).intersects(b)
+    };
+    let mut regions: Vec<Bounds<ScaledPixels>> = Vec::new();
+    for bounds in changed {
+        regions.push(bounds);
+        // Joining two regions can bring the result near a third: keep going
+        // until nothing is near anything else.
+        while let Some((index, other)) = regions
+            .iter()
+            .enumerate()
+            .rev()
+            .skip(1)
+            .find(|(_, other)| near(other, regions.last().unwrap()))
+            .map(|(index, other)| (index, *other))
+        {
+            let last = regions.pop().unwrap();
+            regions.remove(index);
+            regions.push(last.union(&other));
+        }
+    }
+    while regions.len() > MAX_REGIONS {
+        let mut best = (0, 1, f32::MAX);
+        for i in 0..regions.len() {
+            for j in i + 1..regions.len() {
+                let growth =
+                    area(&regions[i].union(&regions[j])) - area(&regions[i]) - area(&regions[j]);
+                if growth < best.2 {
+                    best = (i, j, growth);
+                }
+            }
+        }
+        let (i, j, _) = best;
+        let joined = regions[i].union(&regions[j]);
+        regions.remove(j);
+        regions[i] = joined;
+        // The join may now overlap another region.
+        while let Some(k) =
+            (0..regions.len()).find(|&k| k != i && regions[k].intersects(&regions[i]))
+        {
+            let other = regions.remove(k);
+            let i = if k < i { i - 1 } else { i };
+            regions[i] = regions[i].union(&other);
+        }
+    }
+    regions.into_iter().collect()
+}
+
+fn area(bounds: &Bounds<ScaledPixels>) -> f32 {
+    area_of(bounds.size)
+}
+
+fn area_of(size: Size<ScaledPixels>) -> f32 {
+    size.width.0 * size.height.0
 }
 
 /// Where a glyph or icon can land: its bounds, or its whole clip when it is
@@ -287,10 +366,10 @@ mod tests {
         let after = FrameDigest::of(&scene(&[quad(0.0, 0.0, 0), quad(120.0, 100.0, 1)]), SIZE);
         assert_eq!(
             after.damage_since(Some(&before)),
-            Damage::Region(Bounds {
+            Damage::Regions(SmallVec::from_slice(&[Bounds {
                 origin: point(ScaledPixels(100.0), ScaledPixels(100.0)),
                 size: size(ScaledPixels(30.0), ScaledPixels(10.0)),
-            })
+            }]))
         );
     }
 
@@ -317,11 +396,48 @@ mod tests {
         let after = FrameDigest::of(&with_shadow, SIZE);
         assert_eq!(
             after.damage_since(Some(&before)),
-            Damage::Region(Bounds {
+            Damage::Regions(SmallVec::from_slice(&[Bounds {
                 origin: point(ScaledPixels(94.0), ScaledPixels(94.0)),
                 size: size(ScaledPixels(22.0), ScaledPixels(22.0)),
-            })
+            }]))
         );
+    }
+
+    #[test]
+    fn changes_far_apart_are_separate_regions() {
+        // A playhead near the top and a meter near the bottom.
+        let before = FrameDigest::of(&scene(&[quad(10.0, 10.0, 0), quad(900.0, 900.0, 1)]), SIZE);
+        let after = FrameDigest::of(&scene(&[quad(12.0, 10.0, 0), quad(900.0, 902.0, 1)]), SIZE);
+        let Damage::Regions(regions) = after.damage_since(Some(&before)) else {
+            panic!("expected regions");
+        };
+        assert_eq!(regions.len(), 2);
+    }
+
+    #[test]
+    fn many_changes_are_joined_into_a_few_regions_that_do_not_overlap() {
+        let spread: Vec<Quad> = (0..30)
+            .map(|i| quad((i % 6) as f32 * 160.0, (i / 6) as f32 * 190.0, i))
+            .collect();
+        let before = FrameDigest::of(&scene(&[]), SIZE);
+        let after = FrameDigest::of(&scene(&spread), SIZE);
+        let Damage::Regions(regions) = after.damage_since(Some(&before)) else {
+            panic!("expected regions");
+        };
+        assert!(regions.len() <= MAX_REGIONS);
+        for (i, a) in regions.iter().enumerate() {
+            for b in &regions[i + 1..] {
+                assert!(!a.intersects(b), "{a:?} overlaps {b:?}");
+            }
+        }
+        // Every change is inside some region.
+        for quad in &spread {
+            assert!(
+                regions
+                    .iter()
+                    .any(|region| region.intersect(&quad.bounds) == quad.bounds)
+            );
+        }
     }
 
     #[test]
