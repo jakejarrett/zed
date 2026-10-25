@@ -1389,7 +1389,8 @@ impl WgpuRendererCore {
     ) -> Self {
         let device = Arc::clone(&context.device);
         let queue = Arc::clone(&context.queue);
-        let mut rendering_params = RenderingParameters::new(&context.adapter, target_format);
+        let mut rendering_params =
+            RenderingParameters::new(&context.adapter, &context.device, target_format);
         let full_path_sample_count = rendering_params.path_sample_count;
         // `GPUI_PATH_SAMPLES=1|2|4`, for comparing what multisampling costs.
         if let Some(samples) = std::env::var("GPUI_PATH_SAMPLES")
@@ -3012,6 +3013,21 @@ fn plan_path_batches(
     plans
 }
 
+/// The sample counts a device can render `format` at. The adapter lists every
+/// count its hardware has, but beyond WebGPU's guaranteed 1x and 4x a device
+/// accepts them only when created with `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`.
+fn device_sample_support(
+    adapter: wgpu::TextureFormatFeatureFlags,
+    adapter_specific: bool,
+) -> wgpu::TextureFormatFeatureFlags {
+    use wgpu::TextureFormatFeatureFlags as Flags;
+    if adapter_specific {
+        adapter
+    } else {
+        adapter - (Flags::MULTISAMPLE_X2 | Flags::MULTISAMPLE_X8 | Flags::MULTISAMPLE_X16)
+    }
+}
+
 /// Path multisampling in low power mode: 2x where the format supports it,
 /// else the usual count. Some GPUs offer only 1x and 4x (the Raspberry Pi 5's
 /// V3D), and 1x is a coarser look than low power promises.
@@ -3050,13 +3066,22 @@ struct RenderingParameters {
 }
 
 impl RenderingParameters {
-    fn new(adapter: &wgpu::Adapter, surface_format: wgpu::TextureFormat) -> Self {
+    fn new(
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+        surface_format: wgpu::TextureFormat,
+    ) -> Self {
         use std::env;
 
-        let format_features = adapter.get_texture_format_features(surface_format);
+        let path_sample_support = device_sample_support(
+            adapter.get_texture_format_features(surface_format).flags,
+            device
+                .features()
+                .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES),
+        );
         let path_sample_count = [4, 2, 1]
             .into_iter()
-            .find(|&n| format_features.flags.sample_count_supported(n))
+            .find(|&n| path_sample_support.sample_count_supported(n))
             .unwrap_or(1);
 
         let gamma = env::var("ZED_FONTS_GAMMA")
@@ -3080,7 +3105,7 @@ impl RenderingParameters {
 
         Self {
             path_sample_count,
-            path_sample_support: format_features.flags,
+            path_sample_support,
             gamma_ratios,
             grayscale_enhanced_contrast,
             subpixel_enhanced_contrast,
@@ -3509,6 +3534,18 @@ mod path_pass_tests {
             .map(|(plan, _)| plan)
             .collect();
         assert_eq!(plans, vec![PathPlan::Skip, PathPlan::Ahead]);
+    }
+
+    #[test]
+    fn counts_beyond_the_guaranteed_need_the_adapter_specific_feature() {
+        use wgpu::TextureFormatFeatureFlags as Flags;
+        // An AMD card: 1x, 2x, 4x and 8x in hardware.
+        let amd = Flags::MULTISAMPLE_X2 | Flags::MULTISAMPLE_X4 | Flags::MULTISAMPLE_X8;
+        assert!(device_sample_support(amd, true).sample_count_supported(2));
+        let guaranteed = device_sample_support(amd, false);
+        assert!(!guaranteed.sample_count_supported(2));
+        assert!(guaranteed.sample_count_supported(4));
+        assert_eq!(low_power_path_samples(4, guaranteed), 4);
     }
 
     #[test]
