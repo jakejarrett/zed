@@ -1752,18 +1752,11 @@ impl WgpuRendererCore {
         // tiling GPU each stop stores and reloads the whole frame. The first
         // batch that overlaps one before it ends the run, as rasterising it
         // clears the intermediate the rest would still be read from.
-        let path_plans = plan_path_batches(scene, damage);
-        let any_alone = path_plans.iter().any(|(plan, _)| *plan == PathPlan::Alone);
-        // Each damaged region draws the scene again under its own scissor,
-        // all in the one pass; a path batch that has to stop the pass can only
-        // be drawn under one, so then the regions are drawn as their union.
-        let mut regions: SmallVec<[Bounds<ScaledPixels>; 8]> = damage
-            .map(|damage| damage.iter().copied().collect())
-            .unwrap_or_default();
+        let FramePlan {
+            regions,
+            path_plans,
+        } = plan_frame(scene, damage);
         let union = regions.iter().copied().reduce(|a, b| a.union(&b));
-        if regions.len() > 1 && any_alone {
-            regions = union.into_iter().collect();
-        }
         let union_scissor = union.map(|union| scissor_rect(union, size));
         let scissors: SmallVec<[Option<[u32; 4]>; 8]> = if regions.is_empty() {
             SmallVec::from_elem(None, 1)
@@ -2971,6 +2964,39 @@ enum PathPlan {
     Alone,
 }
 
+/// The regions a frame is drawn in and how each path batch is drawn.
+struct FramePlan {
+    regions: SmallVec<[Bounds<ScaledPixels>; 8]>,
+    path_plans: Vec<(PathPlan, SmallVec<[Bounds<ScaledPixels>; 4]>)>,
+}
+
+/// Each damaged region draws the scene again under its own scissor, all in
+/// the one pass; a path batch that has to stop the pass can only be drawn
+/// under one, so then the regions are drawn as their union. The path plans
+/// are then made again against that union: everything in it is cleared, so a
+/// batch skipped for missing the separate regions would vanish from the part
+/// of the union between them (waveforms blinking out as a playhead moved).
+fn plan_frame(scene: &Scene, damage: Option<&[Bounds<ScaledPixels>]>) -> FramePlan {
+    let mut regions: SmallVec<[Bounds<ScaledPixels>; 8]> = damage
+        .map(|damage| damage.iter().copied().collect())
+        .unwrap_or_default();
+    let mut path_plans = plan_path_batches(scene, damage);
+    let any_alone = path_plans.iter().any(|(plan, _)| *plan == PathPlan::Alone);
+    if regions.len() > 1 && any_alone {
+        regions = regions
+            .iter()
+            .copied()
+            .reduce(|a, b| a.union(&b))
+            .into_iter()
+            .collect();
+        path_plans = plan_path_batches(scene, Some(&regions));
+    }
+    FramePlan {
+        regions,
+        path_plans,
+    }
+}
+
 /// The plan for each non-empty path batch, in draw order, and each one's
 /// footprint. With `damage`, a batch none of whose footprint touches it is
 /// skipped.
@@ -3534,6 +3560,44 @@ mod path_pass_tests {
             .map(|(plan, _)| plan)
             .collect();
         assert_eq!(plans, vec![PathPlan::Skip, PathPlan::Ahead]);
+    }
+
+    #[test]
+    fn regions_drawn_as_their_union_draw_every_path_inside_it() {
+        let mut scene = Scene::default();
+        // The quads keep the paths in separate batches; the second path
+        // overlaps the first, so it stops the pass and the regions join.
+        scene.insert_primitive(triangle(0.0, 0.0));
+        scene.insert_primitive(cover(400.0));
+        scene.insert_primitive(triangle(2.0, 2.0));
+        scene.insert_primitive(cover(500.0));
+        scene.insert_primitive(triangle(300.0, 300.0));
+        scene.finish();
+        let region = |x: f32| Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(x)),
+            size: size(ScaledPixels(20.0), ScaledPixels(20.0)),
+        };
+        let damage = [region(0.0), region(600.0)];
+        let plan = plan_frame(&scene, Some(&damage));
+        assert_eq!(plan.regions.len(), 1, "drawn as one region");
+        let plans: Vec<PathPlan> = plan.path_plans.iter().map(|(plan, _)| *plan).collect();
+        // The third path is between the two regions, inside their union:
+        // the union is cleared, so it has to be drawn again.
+        assert_eq!(
+            plans,
+            vec![PathPlan::Ahead, PathPlan::Alone, PathPlan::Alone]
+        );
+
+        // Drawn as separate regions, a path between them is still skipped.
+        let mut scene = Scene::default();
+        scene.insert_primitive(triangle(0.0, 0.0));
+        scene.insert_primitive(cover(400.0));
+        scene.insert_primitive(triangle(300.0, 300.0));
+        scene.finish();
+        let plan = plan_frame(&scene, Some(&damage));
+        assert_eq!(plan.regions.len(), 2);
+        let plans: Vec<PathPlan> = plan.path_plans.iter().map(|(plan, _)| *plan).collect();
+        assert_eq!(plans, vec![PathPlan::Ahead, PathPlan::Skip]);
     }
 
     #[test]
